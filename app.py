@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import json
 import datetime
+import re
 from math import radians, sin, cos, sqrt, atan2, pi
 
 # 1. Page Configuration & Setup
@@ -57,7 +58,37 @@ cfg_is_apst = st.sidebar.checkbox("APST Local Partner Active", value=True)
 cfg_road_km = st.sidebar.number_input("Assumed Access Road Construction (km)", value=2.0, step=0.5)
 cfg_gemini_model = st.sidebar.selectbox("Gemini Model Version", ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro"])
 
-# 4. Helper Math & Mathematical Engines
+# 4. Helper Math, DMS Parsers & Engines
+def parse_dms(coord_str):
+    coord_str = str(coord_str).strip()
+    try:
+        return float(coord_str) # Falls back seamlessly if user types standard decimal degrees
+    except ValueError:
+        pass
+    # Extract components using regex for 28°53'09.2"N
+    cleaned = coord_str.replace("''", '"').replace('°', ' ').replace("'", ' ').replace('"', ' ').strip()
+    match = re.search(r'(\d+)\s+(\d+)\s+([\d\.]+)\s*([NSEWnsew]?)', cleaned)
+    if match:
+        d = float(match.group(1))
+        m = float(match.group(2))
+        s = float(match.group(3))
+        direction = match.group(4).upper()
+        
+        dd = d + (m / 60.0) + (s / 3600.0)
+        if direction in ['S', 'W']:
+            dd = -dd
+        return dd
+    return None
+
+def format_dms(dd, is_lat):
+    if dd is None: return ""
+    direction = ('N' if dd >= 0 else 'S') if is_lat else ('E' if dd >= 0 else 'W')
+    dd = abs(dd)
+    d = int(dd)
+    m = int((dd - d) * 60)
+    s = (dd - d - m/60) * 3600
+    return f"{d}°{m}'{s:.1f}\"{direction}"
+
 def haversine_km(lat1, lng1, lat2, lng2):
     R = 6371.0
     dlat = radians(lat2 - lat1)
@@ -83,6 +114,32 @@ def compute_capex(mw, penstock_m, transmission_km, road_km, is_apst):
         'total': total, 'per_mw': total / mw if mw > 0 else 0
     }
 
+def process_intake(click_lat, click_lng):
+    pt = ee.Geometry.Point([click_lng, click_lat])
+    merit_hydro = ee.Image('MERIT/Hydro/v1_0_1')
+    try:
+        upa_val = merit_hydro.select('upa').sample(pt, scale=90).first().get('upa').getInfo()
+        if upa_val is None or upa_val < 10.0:
+            buffer = pt.buffer(250)
+            clipped = merit_hydro.select('upa').clip(buffer)
+            max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
+            max_upa = max_dict.get('upa')
+            if max_upa and max_upa >= 10.0:
+                upa_val = max_upa
+        
+        if upa_val and upa_val >= 10.0:
+            st.session_state["site_data"]["intake_lat"] = click_lat
+            st.session_state["site_data"]["intake_lng"] = click_lng
+            st.session_state["site_data"]["catchment_km2"] = upa_val
+            st.session_state["workflow_state"] = "CONFIRM_INTAKE"
+            return True
+        else:
+            st.error("Catchment area falls below 10 sq km baseline. Re-click nearer a verified stream reach.")
+            return False
+    except Exception as ex:
+        st.error(f"GEE processing anomaly: {str(ex)}")
+        return False
+
 def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
     try:
         dem = ee.Image('MERIT/DEM/v1_0_3').select('dem')
@@ -98,12 +155,8 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         q_design = catchment_km2 * specific_yield
         p_mw = q_design * net_h * 9.81 * cfg_efficiency / 1000.0
         
-        chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')\
-            .filterDate('2000-01-01', '2024-12-31')\
-            .filter(ee.Filter.calendarRange(1, 3, 'month'))
-        mean_lean_daily = chirps.mean().reduceRegion(
-            ee.Reducer.mean(), ee.Geometry.Point([intake_lng, intake_lat]).buffer(5000), 5500
-        ).get('precipitation').getInfo()
+        chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2000-01-01', '2024-12-31').filter(ee.Filter.calendarRange(1, 3, 'month'))
+        mean_lean_daily = chirps.mean().reduceRegion(ee.Reducer.mean(), ee.Geometry.Point([intake_lng, intake_lat]).buffer(5000), 5500).get('precipitation').getInfo()
         
         effective_plf = cfg_default_plf
         if mean_lean_daily and (mean_lean_daily * 30.0) < 40.0:
@@ -113,7 +166,6 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         straight_line_km = haversine_km(intake_lat, intake_lng, ph_lat, ph_lng)
         penstock_m = straight_line_km * 1000.0 * cfg_terrain_mult
         penstock_dia_mm = round(sqrt(4.0 * q_design / (pi * 4.0)) * 1000.0 / 50.0) * 50
-        
         turbine_type = "Pelton (Vertical)" if net_h > 200.0 else ("Francis (Horizontal)" if net_h > 30.0 else "Kaplan / Crossflow")
         num_units = 2 if p_mw >= 4.0 else 1
         
@@ -160,26 +212,23 @@ if "workflow_state" not in st.session_state:
 # 6. Dynamic Map Centering Calculation
 map_center = [28.0, 94.5]
 map_zoom = 7
+sd = st.session_state["site_data"]
 
-if "intake_lat" in st.session_state["site_data"] and "ph_lat" not in st.session_state["site_data"]:
-    map_center = [st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"]]
+if "intake_lat" in sd and "ph_lat" not in sd:
+    map_center = [sd["intake_lat"], sd["intake_lng"]]
+    map_zoom = 13
+elif "intake_lat" in sd and "ph_lat" in sd:
+    map_center = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2]
     map_zoom = 12
-elif "intake_lat" in st.session_state["site_data"] and "ph_lat" in st.session_state["site_data"]:
-    map_center = [
-        (st.session_state["site_data"]["intake_lat"] + st.session_state["site_data"]["ph_lat"]) / 2,
-        (st.session_state["site_data"]["intake_lng"] + st.session_state["site_data"]["ph_lng"]) / 2
-    ]
-    map_zoom = 11
 
 # 7. Twin-Panel Interface Execution
 col_map, col_dash = st.columns([0.55, 0.45])
 
 with col_map:
     st.subheader("Interactive Basin Triage Map")
-    
     m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
     
-    # Advanced Layer Infrastructure Control Toggles
+    # Advanced Layer Infrastructure (Substations OFF by default -> show=False)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", checked=True).add_to(m)
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
@@ -187,21 +236,17 @@ with col_map:
     ).add_to(m)
     folium.TileLayer("openstreetmap", name="Standard Road Overlay Map", checked=False).add_to(m)
     
-    # Feature Group Toggles for Substations
-    substation_group = folium.FeatureGroup(name="18 Verified Substation Radii", checked=True).add_to(m)
+    # Feature Group Toggles for Substations - Default Untoggled
+    substation_group = folium.FeatureGroup(name="18 Verified Substation Radii", show=False).add_to(m)
     for name, s_lat, s_lng in SUBSTATIONS:
         folium.Marker([s_lat, s_lng], tooltip=f"Substation: {name}", icon=folium.Icon(color="orange", icon="flash")).add_to(substation_group)
         folium.Circle([s_lat, s_lng], radius=cfg_substation_limit * 1000, color="orange", fill=False, dash_array="5, 5").add_to(substation_group)
         
-    if "intake_lat" in st.session_state["site_data"]:
-        folium.Marker([st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"]], 
-                      popup="Locked Intake Point", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
-    if "ph_lat" in st.session_state["site_data"]:
-        folium.Marker([st.session_state["site_data"]["ph_lat"], st.session_state["site_data"]["ph_lng"]], 
-                      popup="Locked Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
-        folium.PolyLine([[st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"]],
-                         [st.session_state["site_data"]["ph_lat"], st.session_state["site_data"]["ph_lng"]]], 
-                        color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
+    if "intake_lat" in sd:
+        folium.Marker([sd["intake_lat"], sd["intake_lng"]], popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
+    if "ph_lat" in sd:
+        folium.Marker([sd["ph_lat"], sd["ph_lng"]], popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
+        folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
 
     folium.LayerControl(position="topright").add_to(m)
     map_output = st_folium(m, width="100%", height=620, key="prospector_map")
@@ -211,33 +256,12 @@ with col_map:
         click_lat = map_output["last_clicked"]["lat"]
         click_lng = map_output["last_clicked"]["lng"]
         
-        if st.session_state["workflow_state"] == "AWAITING_INTAKE":
-            pt = ee.Geometry.Point([click_lng, click_lat])
-            merit_hydro = ee.Image('MERIT/Hydro/v1_0_1')
-            try:
-                upa_val = merit_hydro.select('upa').sample(pt, scale=90).first().get('upa').getInfo()
-                if upa_val is None or upa_val < 10.0:
-                    buffer = pt.buffer(250)
-                    clipped = merit_hydro.select('upa').clip(buffer)
-                    max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
-                    max_upa = max_dict.get('upa')
-                    if max_upa and max_upa >= 10.0:
-                        upa_val = max_upa
-                
-                if upa_val and upa_val >= 10.0:
-                    st.session_state["site_data"]["intake_lat"] = click_lat
-                    st.session_state["site_data"]["intake_lng"] = click_lng
-                    st.session_state["site_data"]["catchment_km2"] = upa_val
-                    st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
-                    st.rerun()
-            except Exception as ex:
-                st.error(f"GEE processing anomaly: {str(ex)}")
+        if st.session_state["workflow_state"] in ["AWAITING_INTAKE", "CONFIRM_INTAKE"]:
+            if process_intake(click_lat, click_lng):
+                st.rerun()
 
-        elif st.session_state["workflow_state"] == "AWAITING_POWERHOUSE" and "ph_lat" not in st.session_state["site_data"]:
-            res = process_calculations(
-                st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"],
-                st.session_state["site_data"]["catchment_km2"], click_lat, click_lng
-            )
+        elif st.session_state["workflow_state"] == "AWAITING_POWERHOUSE":
+            res = process_calculations(sd["intake_lat"], sd["intake_lng"], sd["catchment_km2"], click_lat, click_lng)
             if "error" in res:
                 st.error(res["error"])
             else:
@@ -246,40 +270,66 @@ with col_map:
                 st.rerun()
 
 with col_dash:
-    st.subheader("Manual Coordinates & Evaluation Module")
+    st.subheader("Coordinate Engine & Evaluation Module")
     
-    # Manual Input Overrides Matrix
-    with st.expander("Manual Coordinate Input Controls Override", expanded=True):
-        c1, c2 = st.columns(2)
-        in_lat_val = c1.number_input("Intake Latitude Override", value=st.session_state["site_data"].get("intake_lat", 28.0), format="%.5f")
-        in_lng_val = c2.number_input("Intake Longitude Override", value=st.session_state["site_data"].get("intake_lng", 94.5), format="%.5f")
+    if st.session_state["workflow_state"] == "AWAITING_INTAKE":
+        st.info("Action Required: Click the map to plot the Intake, OR enter precise coordinates below.")
         
-        manual_catchment = st.number_input("Manual Target Catchment Area Entry (sq km)", value=st.session_state["site_data"].get("catchment_km2", 100.0), step=10.0)
+    elif st.session_state["workflow_state"] == "CONFIRM_INTAKE":
+        st.warning(f"Intake pinpointed. Extracted Catchment: **{sd['catchment_km2']:.1f} sq km**.")
+        st.info("⚠️ Is the weir site accurately placed on the map? If not, click the map again to adjust the pin, or override the coordinates below. Once satisfied, click Lock.")
+        if st.button("✅ Lock Intake Location & Proceed", type="primary", use_container_width=True):
+            st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
+            st.rerun()
+            
+    elif st.session_state["workflow_state"] == "AWAITING_POWERHOUSE":
+        st.success("Intake locked.")
+        st.info("Action Required: Click the map to drop the Powerhouse pin, OR enter precise coordinates below.")
+
+    # Manual Input DMS System Override
+    with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] == "AWAITING_INTAKE")):
+        st.caption("Supports standard Decimal (28.885) or DMS format (28°53'09.2\"N)")
+        c1, c2 = st.columns(2)
+        in_lat_val = c1.text_input("Intake Latitude", value=format_dms(sd.get("intake_lat"), True), placeholder="e.g. 28°53'09.2\"N")
+        in_lng_val = c2.text_input("Intake Longitude", value=format_dms(sd.get("intake_lng"), False), placeholder="e.g. 76°38'13.6\"E")
         
         c3, c4 = st.columns(2)
-        ph_lat_val = c3.number_input("Powerhouse Latitude Override", value=st.session_state["site_data"].get("ph_lat", 27.95), format="%.5f")
-        ph_lng_val = c4.number_input("Powerhouse Longitude Override", value=st.session_state["site_data"].get("ph_lng", 94.45), format="%.5f")
+        ph_lat_val = c3.text_input("Powerhouse Latitude", value=format_dms(sd.get("ph_lat"), True))
+        ph_lng_val = c4.text_input("Powerhouse Longitude", value=format_dms(sd.get("ph_lng"), False))
         
-        if st.button("Apply Manual Coordinates & Re-evaluate Engine"):
-            res = process_calculations(in_lat_val, in_lng_val, manual_catchment, ph_lat_val, ph_lng_val)
-            if "error" in res:
-                st.error(res["error"])
+        if st.button("Apply Manual Coordinates Engine"):
+            p_in_lat, p_in_lng = parse_dms(in_lat_val), parse_dms(in_lng_val)
+            p_ph_lat, p_ph_lng = parse_dms(ph_lat_val), parse_dms(ph_lng_val)
+            
+            if p_in_lat and p_in_lng:
+                # If only intake is provided/updated
+                if not (p_ph_lat and p_ph_lng):
+                    if process_intake(p_in_lat, p_in_lng):
+                        st.rerun()
+                # If both are provided, run full simulation
+                else:
+                    if "catchment_km2" not in sd: 
+                        process_intake(p_in_lat, p_in_lng) # Run UPA fetch if bypassing clicking entirely
+                    res = process_calculations(p_in_lat, p_in_lng, st.session_state["site_data"].get("catchment_km2", 100), p_ph_lat, p_ph_lng)
+                    if "error" in res:
+                        st.error(res["error"])
+                    else:
+                        st.session_state["site_data"] = res
+                        st.session_state["workflow_state"] = "COMPLETE"
+                        st.rerun()
             else:
-                st.session_state["site_data"] = res
-                st.session_state["workflow_state"] = "COMPLETE"
-                st.rerun()
+                st.error("Invalid coordinate string provided.")
 
-    # Split Level Modification Adjuster Controls
+    # Independent Node Reset Controls
     if st.session_state["workflow_state"] != "AWAITING_INTAKE":
-        st.markdown("### Independent Node Controls")
         rc1, rc2 = st.columns(2)
-        if rc1.button("Modify / Reset Intake Only"):
+        if rc1.button("Reset Intake Node"):
             st.session_state["site_data"].pop("intake_lat", None)
             st.session_state["site_data"].pop("intake_lng", None)
             st.session_state["site_data"].pop("catchment_km2", None)
             st.session_state["workflow_state"] = "AWAITING_INTAKE"
             st.rerun()
-        if rc2.button("Modify / Reset Powerhouse Only"):
+        if rc2.button("Reset Powerhouse Node"):
             st.session_state["site_data"].pop("ph_lat", None)
             st.session_state["site_data"].pop("ph_lng", None)
             st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
@@ -288,7 +338,6 @@ with col_dash:
     st.markdown("---")
     
     if st.session_state["workflow_state"] == "COMPLETE":
-        sd = st.session_state["site_data"]
         f_color = "green" if sd["flag"] == "GREEN" else ("orange" if sd["flag"] == "AMBER" else "red")
         st.markdown(f"""
         <div style="background-color: {f_color}; padding: 12px; border-radius: 4px; color: white; font-weight: bold; text-align: center; margin-bottom: 15px;">
@@ -315,12 +364,11 @@ with col_dash:
         if action_col1.button("Save Entry to Log"):
             log_row = {
                 "timestamp": datetime.datetime.now().isoformat(), "river_name": river_input,
-                "intake_lat": sd["intake_lat"], "intake_lng": sd["intake_lng"], "ph_lat": sd["ph_lat"], "ph_lng": sd["ph_lng"],
+                "intake_lat": format_dms(sd["intake_lat"], True), "intake_lng": format_dms(sd["intake_lng"], False), 
+                "ph_lat": format_dms(sd["ph_lat"], True), "ph_lng": format_dms(sd["ph_lng"], False),
                 "catchment_km2": sd["catchment_km2"], "gross_head_m": sd["gross_head_m"], "net_head_m": sd["net_head_m"],
                 "penstock_m": sd["penstock_m"], "q_design_cumecs": sd["q_design_cumecs"], "capacity_MW": sd["capacity_MW"],
-                "annual_MWh": sd["annual_MWh"], "plf": sd["plf"], "nearest_substation": sd["nearest_substation"],
-                "substation_km": sd["substation_km"], "voltage_kv": sd["voltage_kv"], "capex_total_cr": sd['capex']["total"],
-                "capex_per_mw": sd['capex']["per_mw"], "flag": sd["flag"], "flag_reason": sd["flag_reason"], "notes": notes_input
+                "annual_MWh": sd["annual_MWh"], "capex_per_mw": sd['capex']["per_mw"], "flag": sd["flag"], "notes": notes_input
             }
             try:
                 df_existing = pd.read_csv("site_log.csv")
@@ -335,10 +383,10 @@ with col_dash:
                 model = genai.GenerativeModel(cfg_gemini_model)
                 site_context_payload = {
                     "topography": {"catchment_sq_km": sd["catchment_km2"], "gross_head_m": sd["gross_head_m"], "net_head_m": sd["net_head_m"]},
-                    "hydrology": {"design_flow_cumecs": sd["q_design_cumecs"], "specific_yield": sd["specific_yield"], "projected_annual_generation_mwh": sd["annual_MWh"], "plf_percentage": sd["plf"]},
+                    "hydrology": {"design_flow_cumecs": sd["q_design_cumecs"], "specific_yield": sd["specific_yield"], "projected_annual_generation_mwh": sd["annual_MWh"]},
                     "electro_mechanical": {"capacity_mw": sd["capacity_MW"], "turbine_type": sd["turbine_type"], "unit_count": sd["num_units"]},
-                    "infrastructure": {"penstock_length_m": sd["penstock_m"], "penstock_diameter_mm": sd["penstock_dia_mm"], "nearest_substation": sd["nearest_substation"], "interconnection_distance_km": sd["substation_km"], "evacuation_voltage_kv": sd["voltage_kv"]},
-                    "financials": {"total_capex_cr": sd['capex']["total"], "capex_per_mw_cr": sd['capex']["per_mw"], "civil_works_cr": sd['capex']['civil'], "e_m_package_cr": sd['capex']['em'], "penstock_cost_cr": sd['capex']['penstock'], "land_acquisition_cost_cr": sd['capex']['land'], "mnre_subsidy_eligibility_cr": min(30.0, 3.6 * sd["capacity_MW"])}
+                    "infrastructure": {"penstock_length_m": sd["penstock_m"], "nearest_substation": sd["nearest_substation"], "interconnection_distance_km": sd["substation_km"]},
+                    "financials": {"total_capex_cr": sd['capex']["total"], "capex_per_mw_cr": sd['capex']["per_mw"], "mnre_subsidy_eligibility_cr": min(30.0, 3.6 * sd["capacity_MW"])}
                 }
                 
                 prompt = f"""
@@ -378,12 +426,3 @@ with col_dash:
             if "feasibility_note" in st.session_state:
                 del st.session_state["feasibility_note"]
             st.rerun()
-
-# 8. Persistent Log Management Interface Layer
-st.markdown("---")
-with st.expander("Review Local Site Assessment Log Database"):
-    try:
-        df_log = pd.read_csv("site_log.csv")
-        st.dataframe(df_log)
-    except FileNotFoundError:
-        st.info("No registered records located in active environment.")
