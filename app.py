@@ -12,10 +12,9 @@ import re
 import copy
 from math import radians, sin, cos, sqrt, atan2, pi
 
-# 1. Page Configuration & CSS Fixes for Cut-off Numbers
+# 1. Page Configuration & CSS Fixes
 st.set_page_config(layout="wide", page_title="Sahaj Urja Site Prospector")
 
-# Inject CSS to prevent metrics from overflowing/cutting off
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] {
@@ -97,19 +96,31 @@ cfg_road_km = st.sidebar.number_input("Assumed Access Road Construction (km)", v
 cfg_gemini_model = st.sidebar.selectbox("Gemini Model Version", ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-pro"])
 
 # 4. Helper Math, DMS Parsers & Engines
-def parse_dms(coord_str):
+def parse_combined_coords(coord_str):
+    if not coord_str: return None, None
     coord_str = str(coord_str).strip()
-    try:
-        return float(coord_str)
-    except ValueError:
-        pass
+    
+    # Clean the string for regex processing
     cleaned = coord_str.replace("''", '"').replace('°', ' ').replace("'", ' ').replace('"', ' ').strip()
-    match = re.search(r'(\d+)\s+(\d+)\s+([\d\.]+)\s*([NSEWnsew]?)', cleaned)
-    if match:
-        d, m, s, direction = float(match.group(1)), float(match.group(2)), float(match.group(3)), match.group(4).upper()
-        dd = d + (m / 60.0) + (s / 3600.0)
-        return -dd if direction in ['S', 'W'] else dd
-    return None
+    
+    # Try finding explicit DMS patterns (matches Lat and Lng blocks)
+    matches = re.findall(r'(\d+)\s+(\d+)\s+([\d\.]+)\s*([NSEWnsew])', cleaned)
+    if len(matches) >= 2:
+        lat_dd = float(matches[0][0]) + float(matches[0][1])/60.0 + float(matches[0][2])/3600.0
+        if matches[0][3].upper() in ['S', 'W']: lat_dd = -lat_dd
+        
+        lng_dd = float(matches[1][0]) + float(matches[1][1])/60.0 + float(matches[1][2])/3600.0
+        if matches[1][3].upper() in ['S', 'W']: lng_dd = -lng_dd
+        return lat_dd, lng_dd
+    
+    # Fallback for standard decimal format (e.g. "28.5, 94.2" or "28.5 94.2")
+    try:
+        parts = [p for p in re.split(r'[,\s]+', coord_str) if p]
+        if len(parts) >= 2:
+            return float(parts[0]), float(parts[1])
+    except:
+        pass
+    return None, None
 
 def format_dms(dd, is_lat):
     if dd is None: return ""
@@ -118,7 +129,11 @@ def format_dms(dd, is_lat):
     d = int(dd)
     m = int((dd - d) * 60)
     s = (dd - d - m/60) * 3600
-    return f"{d}°{m}'{s:.1f}\"{direction}"
+    return f"{d}°{m}'{s:.2f}\"{direction}"
+
+def format_combined_dms(lat, lng):
+    if lat is None or lng is None: return ""
+    return f"{format_dms(lat, True)} {format_dms(lng, False)}"
 
 def haversine_km(lat1, lng1, lat2, lng2):
     R = 6371.0
@@ -241,13 +256,12 @@ with col_map:
     st.subheader("Interactive Basin Triage Map")
     m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
     
-    # Layer Overrides (Satellite is now Default)
+    # Layer Overrides (Google Hybrid as Default for highly detailed place names & roads over satellite)
     folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri", name="High-Res Satellite Imagery", show=True
+        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        attr="Google", name="High-Res Satellite Hybrid (Labels + Borders)", show=True
     ).add_to(m)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", show=False).add_to(m)
-    folium.TileLayer("openstreetmap", name="Standard Road Overlay Map", show=False).add_to(m)
     
     # Substations off by default to reduce clutter
     substation_group = folium.FeatureGroup(name="18 Verified Substation Radii", show=False).add_to(m)
@@ -269,7 +283,6 @@ with col_map:
         click_lat, click_lng = map_output["last_clicked"]["lat"], map_output["last_clicked"]["lng"]
         current_click = (click_lat, click_lng)
         
-        # Prevent re-trigger on unchanged clicks
         if st.session_state.get("last_processed_click") != current_click:
             push_state_to_history()
             st.session_state["last_processed_click"] = current_click
@@ -305,18 +318,13 @@ with col_dash:
         st.info("Action Required: Click the map to drop the Powerhouse pin, OR enter precise coordinates below.")
 
     with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] == "AWAITING_INTAKE")):
-        c1, c2 = st.columns(2)
-        in_lat_val = c1.text_input("Intake Latitude", value=format_dms(sd.get("intake_lat"), True), placeholder="28°53'09.2\"N")
-        in_lng_val = c2.text_input("Intake Longitude", value=format_dms(sd.get("intake_lng"), False), placeholder="76°38'13.6\"E")
-        
-        c3, c4 = st.columns(2)
-        ph_lat_val = c3.text_input("Powerhouse Latitude", value=format_dms(sd.get("ph_lat"), True))
-        ph_lng_val = c4.text_input("Powerhouse Longitude", value=format_dms(sd.get("ph_lng"), False))
+        in_coord_val = st.text_input("Intake Coordinates", value=format_combined_dms(sd.get("intake_lat"), sd.get("intake_lng")), placeholder="27°54'16.27\"N 94°06'07.18\"E")
+        ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
         
         if st.button("Apply Manual Coordinates Engine"):
             push_state_to_history()
-            p_in_lat, p_in_lng = parse_dms(in_lat_val), parse_dms(in_lng_val)
-            p_ph_lat, p_ph_lng = parse_dms(ph_lat_val), parse_dms(ph_lng_val)
+            p_in_lat, p_in_lng = parse_combined_coords(in_coord_val)
+            p_ph_lat, p_ph_lng = parse_combined_coords(ph_coord_val)
             
             if p_in_lat and p_in_lng:
                 if not (p_ph_lat and p_ph_lng):
@@ -330,7 +338,7 @@ with col_dash:
                         st.session_state["workflow_state"] = "COMPLETE"
                         st.rerun()
             else:
-                st.error("Invalid coordinate string provided.")
+                st.error("Invalid coordinate string provided. Ensure it matches format 27°54'16\"N 94°06'07\"E")
 
     if st.session_state["workflow_state"] != "AWAITING_INTAKE":
         rc1, rc2 = st.columns(2)
