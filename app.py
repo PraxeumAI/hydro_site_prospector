@@ -13,7 +13,7 @@ import copy
 import os
 from math import radians, sin, cos, sqrt, atan2, pi
 
-# 1. Page Configuration & CSS Fixes
+# 1. Page Configuration & CSS Fixes (Native Background)
 st.set_page_config(layout="wide", page_title="Sahaj Urja Site Prospector", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -57,24 +57,16 @@ SUBSTATIONS = [
     ('Kharsang', 27.4130, 95.9980), ('Sagalee', 27.2720, 93.5710), ('Yazali', 27.6180, 93.7340)
 ]
 
-# 3. Sidebar & State Configuration (Includes Map State)
+# 3. Sidebar & History Stack Configuration
 if "history" not in st.session_state:
     st.session_state["history"] = []
 if "last_obj_click" not in st.session_state:
     st.session_state["last_obj_click"] = None
-    
-# Dynamic Map State Trackers
-if "map_center" not in st.session_state:
-    st.session_state["map_center"] = [28.0, 94.5]
-    st.session_state["map_zoom"] = 7
-    st.session_state["force_map_update"] = False
 
 def push_state_to_history():
     st.session_state["history"].append({
         "workflow_state": st.session_state["workflow_state"],
-        "site_data": copy.deepcopy(st.session_state["site_data"]),
-        "map_center": list(st.session_state.get("map_center", [28.0, 94.5])),
-        "map_zoom": st.session_state.get("map_zoom", 7)
+        "site_data": copy.deepcopy(st.session_state["site_data"])
     })
     if len(st.session_state["history"]) > 15:
         st.session_state["history"].pop(0)
@@ -84,16 +76,8 @@ def pop_state_from_history():
         last_state = st.session_state["history"].pop()
         st.session_state["workflow_state"] = last_state["workflow_state"]
         st.session_state["site_data"] = last_state["site_data"]
-        st.session_state["map_center"] = last_state["map_center"]
-        st.session_state["map_zoom"] = last_state["map_zoom"]
-        st.session_state["force_map_update"] = True  # Forces map to revert visually
         st.session_state["last_processed_click"] = None
         st.session_state["last_obj_click"] = None
-
-def force_map_focus(lat, lng, zoom=18):
-    st.session_state["map_center"] = [lat, lng]
-    st.session_state["map_zoom"] = zoom
-    st.session_state["force_map_update"] = True
 
 st.sidebar.header("Map Navigation")
 if st.sidebar.button("↩️ Undo Last Action (Ctrl + Z)", use_container_width=True):
@@ -184,7 +168,7 @@ def process_intake(click_lat, click_lng):
                 snapped_coords = vectors.first().geometry().coordinates().getInfo()
                 click_lng, click_lat = snapped_coords[0], snapped_coords[1]
                 upa_val = max_upa
-                st.toast("Pin snapped to nearest high-flow channel.", icon="💧")
+                st.toast("Pin snapped to nearest high-flow channel.")
         
         if upa_val and upa_val >= 10.0:
             st.session_state["site_data"]["intake_lat"] = click_lat
@@ -264,14 +248,24 @@ if "workflow_state" not in st.session_state:
 
 sd = st.session_state["site_data"]
 
-# 6. User Interface Layout
+# 6. Map State Logic (Stable Centering)
+map_center = [28.0, 94.5]
+map_zoom = 7
+
+if "intake_lat" in sd and "ph_lat" not in sd: 
+    map_center, map_zoom = [sd["intake_lat"], sd["intake_lng"]], 16
+elif "ph_lat" in sd and "intake_lat" not in sd: 
+    map_center, map_zoom = [sd["ph_lat"], sd["ph_lng"]], 16
+elif "intake_lat" in sd and "ph_lat" in sd: 
+    map_center, map_zoom = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2], 14
+
+# 7. User Interface Layout
 col_map, col_dash = st.columns([0.55, 0.45])
 
 with col_map:
     st.subheader("Interactive Basin Triage Map")
     
-    # Initialize Map with Persistent Dynamic Coordinates
-    m = folium.Map(location=st.session_state["map_center"], zoom_start=st.session_state["map_zoom"], tiles=None)
+    m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
     
     folium.TileLayer(tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}", attr="Google", name="High-Res Satellite Hybrid", show=True).add_to(m)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", show=False).add_to(m)
@@ -290,23 +284,13 @@ with col_map:
 
     folium.LayerControl(position="topright").add_to(m)
     
-    # Render Map & Track Live Interactions
-    map_output = st_folium(m, width="100%", height=650, key="prospector_map", returned_objects=["last_clicked", "last_object_clicked", "center", "zoom"])
+    # We only request clicks from Streamlit-Folium to prevent bounce loops
+    map_output = st_folium(m, width="100%", height=650, key="prospector_map", returned_objects=["last_clicked", "last_object_clicked"])
     
     if map_output:
-        # Preserve user pan & zoom dynamically unless we force a focus
-        if not st.session_state.get("force_map_update"):
-            if map_output.get("center"):
-                st.session_state["map_center"] = [map_output["center"]["lat"], map_output["center"]["lng"]]
-            if map_output.get("zoom"):
-                st.session_state["map_zoom"] = map_output["zoom"]
-        else:
-            st.session_state["force_map_update"] = False
-
         obj_click = map_output.get("last_object_clicked")
         map_click = map_output.get("last_clicked")
         
-        # Object Click (Enter Relocation Mode)
         if obj_click and st.session_state.get("last_obj_click") != obj_click:
             st.session_state["last_obj_click"] = obj_click
             c_lat, c_lng = obj_click["lat"], obj_click["lng"]
@@ -320,7 +304,6 @@ with col_map:
                 st.session_state["workflow_state"] = "RELOCATE_POWERHOUSE"
                 st.rerun()
                 
-        # Map Click (Drop Pin & Zoom)
         elif map_click and st.session_state.get("last_processed_click") != map_click:
             st.session_state["last_processed_click"] = map_click
             click_lat, click_lng = map_click["lat"], map_click["lng"]
@@ -328,7 +311,6 @@ with col_map:
             if st.session_state["workflow_state"] in ["AWAITING_INTAKE", "CONFIRM_INTAKE", "RELOCATE_INTAKE"]:
                 push_state_to_history()
                 if process_intake(click_lat, click_lng):
-                    force_map_focus(sd["intake_lat"], sd["intake_lng"])  # Zooms into snapped intake
                     if "ph_lat" in sd:
                         res = process_calculations(st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"], st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"])
                         if "error" not in res:
@@ -344,7 +326,6 @@ with col_map:
                 else:
                     st.session_state["site_data"] = res
                     st.session_state["workflow_state"] = "COMPLETE"
-                    force_map_focus(click_lat, click_lng) # Zooms into powerhouse
                     st.rerun()
 
 with col_dash:
@@ -385,9 +366,7 @@ with col_dash:
             
             if p_in_lat and p_in_lng:
                 if not (p_ph_lat and p_ph_lng):
-                    if process_intake(p_in_lat, p_in_lng): 
-                        force_map_focus(sd["intake_lat"], sd["intake_lng"])
-                        st.rerun()
+                    if process_intake(p_in_lat, p_in_lng): st.rerun()
                 else:
                     if "catchment_km2" not in sd: process_intake(p_in_lat, p_in_lng)
                     res = process_calculations(p_in_lat, p_in_lng, st.session_state["site_data"].get("catchment_km2", 100), p_ph_lat, p_ph_lng)
@@ -396,7 +375,6 @@ with col_dash:
                     else:
                         st.session_state["site_data"] = res
                         st.session_state["workflow_state"] = "COMPLETE"
-                        force_map_focus(p_ph_lat, p_ph_lng)
                         st.rerun()
             else:
                 st.error("Invalid coordinate string provided. Ensure it matches format 27°54'16\"N 94°06'07\"E")
@@ -493,7 +471,7 @@ with col_dash:
             st.markdown(st.session_state["feasibility_note"])
             st.download_button("Download MD", data=st.session_state["feasibility_note"], file_name=f"Sahaj_Urja_PFN_{river_input or 'Unassigned'}.md")
 
-# 7. Site Log Viewer
+# 8. Site Log Viewer
 with st.expander("View Local Site Log Database (site_log.csv)", expanded=False):
     if os.path.exists("site_log.csv"):
         log_df = pd.read_csv("site_log.csv")
