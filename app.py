@@ -59,6 +59,8 @@ SUBSTATIONS = [
 # 3. Sidebar & History Stack Configuration
 if "history" not in st.session_state:
     st.session_state["history"] = []
+if "last_obj_click" not in st.session_state:
+    st.session_state["last_obj_click"] = None
 
 def push_state_to_history():
     st.session_state["history"].append({
@@ -74,6 +76,7 @@ def pop_state_from_history():
         st.session_state["workflow_state"] = last_state["workflow_state"]
         st.session_state["site_data"] = last_state["site_data"]
         st.session_state["last_processed_click"] = None
+        st.session_state["last_obj_click"] = None
 
 st.sidebar.header("Map Navigation")
 undo_btn = st.sidebar.button("↩️ Undo Last Action (Ctrl + Z)", use_container_width=True)
@@ -262,6 +265,10 @@ with col_map:
     ).add_to(m)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", show=False).add_to(m)
     
+    # Crosshair cursor injection for relocation modes
+    if st.session_state["workflow_state"] in ["RELOCATE_INTAKE", "RELOCATE_POWERHOUSE"]:
+        m.get_root().html.add_child(folium.Element("<style>.leaflet-container { cursor: crosshair !important; }</style>"))
+    
     # Substations off by default
     substation_group = folium.FeatureGroup(name="18 Verified Substation Radii", show=False).add_to(m)
     for name, s_lat, s_lng in SUBSTATIONS:
@@ -269,31 +276,57 @@ with col_map:
         folium.Circle([s_lat, s_lng], radius=cfg_substation_limit * 1000, color="orange", fill=False, dash_array="5, 5").add_to(substation_group)
         
     if "intake_lat" in sd:
-        folium.Marker([sd["intake_lat"], sd["intake_lng"]], popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud"), draggable=True).add_to(m)
+        folium.Marker([sd["intake_lat"], sd["intake_lng"]], tooltip="Click to Relocate Intake Pin", popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
     if "ph_lat" in sd:
-        folium.Marker([sd["ph_lat"], sd["ph_lng"]], popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt"), draggable=True).add_to(m)
+        folium.Marker([sd["ph_lat"], sd["ph_lng"]], tooltip="Click to Relocate Powerhouse Pin", popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
     
-    # Draw line only if BOTH points exist
     if "intake_lat" in sd and "ph_lat" in sd:
         folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
 
     folium.LayerControl(position="topright").add_to(m)
+    
+    # Capture Map & Object Clicks
     map_output = st_folium(m, width="100%", height=650, key="prospector_map")
     
-    # Click Processing
-    if map_output and map_output.get("last_clicked"):
-        click_lat, click_lng = map_output["last_clicked"]["lat"], map_output["last_clicked"]["lng"]
-        current_click = (click_lat, click_lng)
+    if map_output:
+        obj_click = map_output.get("last_object_clicked")
+        map_click = map_output.get("last_clicked")
         
-        if st.session_state.get("last_processed_click") != current_click:
-            push_state_to_history()
-            st.session_state["last_processed_click"] = current_click
+        # 1. Did the user click an existing pin? (Enter Relocation Mode)
+        if obj_click and st.session_state.get("last_obj_click") != obj_click:
+            st.session_state["last_obj_click"] = obj_click
+            c_lat = obj_click["lat"]
             
-            if st.session_state["workflow_state"] in ["AWAITING_INTAKE", "CONFIRM_INTAKE"]:
+            # Identify which pin was clicked
+            if "intake_lat" in sd and abs(sd["intake_lat"] - c_lat) < 0.005:
+                push_state_to_history()
+                st.session_state["workflow_state"] = "RELOCATE_INTAKE"
+                st.rerun()
+            elif "ph_lat" in sd and abs(sd["ph_lat"] - c_lat) < 0.005:
+                push_state_to_history()
+                st.session_state["workflow_state"] = "RELOCATE_POWERHOUSE"
+                st.rerun()
+                
+        # 2. Did the user click the map? (Drop the pin)
+        elif map_click and st.session_state.get("last_processed_click") != map_click:
+            st.session_state["last_processed_click"] = map_click
+            click_lat, click_lng = map_click["lat"], map_click["lng"]
+            
+            # Dropping an Intake Pin
+            if st.session_state["workflow_state"] in ["AWAITING_INTAKE", "CONFIRM_INTAKE", "RELOCATE_INTAKE"]:
+                push_state_to_history()
                 if process_intake(click_lat, click_lng):
+                    # If we were relocating from a complete state, recalculate immediately
+                    if "ph_lat" in sd:
+                        res = process_calculations(click_lat, click_lng, st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"])
+                        if "error" not in res:
+                            st.session_state["site_data"] = res
+                            st.session_state["workflow_state"] = "COMPLETE"
                     st.rerun()
-
-            elif st.session_state["workflow_state"] == "AWAITING_POWERHOUSE":
+                    
+            # Dropping a Powerhouse Pin
+            elif st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "RELOCATE_POWERHOUSE"]:
+                push_state_to_history()
                 res = process_calculations(sd["intake_lat"], sd["intake_lng"], sd["catchment_km2"], click_lat, click_lng)
                 if "error" in res: st.error(res["error"])
                 else:
@@ -304,12 +337,13 @@ with col_map:
 with col_dash:
     st.subheader("Coordinate Engine & Evaluation Module")
     
+    # Dynamic Contextual Instructions
     if st.session_state["workflow_state"] == "AWAITING_INTAKE":
         st.info("Action Required: Click the map to plot the Intake, OR enter precise coordinates below.")
         
     elif st.session_state["workflow_state"] == "CONFIRM_INTAKE":
         st.warning(f"Intake pinpointed. Extracted Catchment: **{sd['catchment_km2']:.1f} sq km**.")
-        st.info("⚠️ Is the weir site accurately placed on the map? If not, hover over the pin to drag it, or click the map again to adjust the pin. Once satisfied, click Lock.")
+        st.info("⚠️ Is the weir site accurately placed on the map? If not, click the pin to unlock it, then click the map to relocate. Once satisfied, click Lock.")
         if st.button("✅ Lock Intake Location & Proceed", type="primary", use_container_width=True):
             push_state_to_history()
             st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
@@ -318,13 +352,20 @@ with col_dash:
     elif st.session_state["workflow_state"] == "AWAITING_POWERHOUSE":
         st.success("Intake locked.")
         st.info("Action Required: Click the map to drop the Powerhouse pin, OR enter precise coordinates below.")
+        
+    elif st.session_state["workflow_state"] == "RELOCATE_INTAKE":
+        st.warning("📍 RELOCATION MODE: The map cursor is a crosshair. Click anywhere on the map to drop the INTAKE pin at its new location.")
+        
+    elif st.session_state["workflow_state"] == "RELOCATE_POWERHOUSE":
+        st.warning("📍 RELOCATION MODE: The map cursor is a crosshair. Click anywhere on the map to drop the POWERHOUSE pin at its new location.")
 
-    with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] == "AWAITING_INTAKE")):
+    # Manual Input Box (Dynamic Display)
+    with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] in ["AWAITING_INTAKE", "AWAITING_POWERHOUSE"])):
         in_coord_val = st.text_input("Intake Coordinates", value=format_combined_dms(sd.get("intake_lat"), sd.get("intake_lng")), placeholder="27°54'16.27\"N 94°06'07.18\"E")
         
         ph_coord_val = ""
         # Only display the Powerhouse coordinate input if Intake is locked or Complete
-        if st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "COMPLETE"]:
+        if st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "COMPLETE", "RELOCATE_POWERHOUSE", "RELOCATE_INTAKE"]:
             ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
         
         if st.button("Apply Manual Coordinates Engine"):
