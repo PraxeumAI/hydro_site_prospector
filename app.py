@@ -1,7 +1,7 @@
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
-import earthengine_api as ee
+import ee
 import google.generativeai as genai
 import pandas as pd
 import numpy as np
