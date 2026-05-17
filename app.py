@@ -57,16 +57,24 @@ SUBSTATIONS = [
     ('Kharsang', 27.4130, 95.9980), ('Sagalee', 27.2720, 93.5710), ('Yazali', 27.6180, 93.7340)
 ]
 
-# 3. Sidebar & History Stack Configuration
+# 3. Sidebar & State Configuration (Includes Map State)
 if "history" not in st.session_state:
     st.session_state["history"] = []
 if "last_obj_click" not in st.session_state:
     st.session_state["last_obj_click"] = None
+    
+# Dynamic Map State Trackers
+if "map_center" not in st.session_state:
+    st.session_state["map_center"] = [28.0, 94.5]
+    st.session_state["map_zoom"] = 7
+    st.session_state["force_map_update"] = False
 
 def push_state_to_history():
     st.session_state["history"].append({
         "workflow_state": st.session_state["workflow_state"],
-        "site_data": copy.deepcopy(st.session_state["site_data"])
+        "site_data": copy.deepcopy(st.session_state["site_data"]),
+        "map_center": list(st.session_state.get("map_center", [28.0, 94.5])),
+        "map_zoom": st.session_state.get("map_zoom", 7)
     })
     if len(st.session_state["history"]) > 15:
         st.session_state["history"].pop(0)
@@ -76,8 +84,16 @@ def pop_state_from_history():
         last_state = st.session_state["history"].pop()
         st.session_state["workflow_state"] = last_state["workflow_state"]
         st.session_state["site_data"] = last_state["site_data"]
+        st.session_state["map_center"] = last_state["map_center"]
+        st.session_state["map_zoom"] = last_state["map_zoom"]
+        st.session_state["force_map_update"] = True  # Forces map to revert visually
         st.session_state["last_processed_click"] = None
         st.session_state["last_obj_click"] = None
+
+def force_map_focus(lat, lng, zoom=18):
+    st.session_state["map_center"] = [lat, lng]
+    st.session_state["map_zoom"] = zoom
+    st.session_state["force_map_update"] = True
 
 st.sidebar.header("Map Navigation")
 if st.sidebar.button("↩️ Undo Last Action (Ctrl + Z)", use_container_width=True):
@@ -162,14 +178,13 @@ def process_intake(click_lat, click_lng):
             clipped = merit_hydro.select('upa').clip(buffer)
             max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
             if max_dict and max_dict.get('upa') and max_dict.get('upa') >= 10.0:
-                # Snap coordinates to the max pixel (Bug 1 Fix)
                 max_upa = max_dict.get('upa')
                 max_pixel_img = clipped.where(clipped.eq(max_upa), 1).selfMask()
                 vectors = max_pixel_img.reduceToVectors(geometry=buffer, scale=90, geometryType='centroid')
                 snapped_coords = vectors.first().geometry().coordinates().getInfo()
                 click_lng, click_lat = snapped_coords[0], snapped_coords[1]
                 upa_val = max_upa
-                st.toast("Pin snapped to nearest high-flow channel.")
+                st.toast("Pin snapped to nearest high-flow channel.", icon="💧")
         
         if upa_val and upa_val >= 10.0:
             st.session_state["site_data"]["intake_lat"] = click_lat
@@ -202,7 +217,6 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2000-01-01', '2024-12-31').filter(ee.Filter.calendarRange(1, 3, 'month'))
         mean_lean_daily = chirps.mean().reduceRegion(ee.Reducer.mean(), ee.Geometry.Point([intake_lng, intake_lat]).buffer(5000), 5500).get('precipitation').getInfo()
         
-        # 40% PLF adjustment for lean season (Bug/Math Fix)
         effective_plf = cfg_default_plf * 0.4 if (mean_lean_daily and (mean_lean_daily * 30.0) < 40.0) else cfg_default_plf
         annual_mwh = p_mw * 8760.0 * effective_plf
         
@@ -216,7 +230,6 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         near_sub, near_dist = min(distances, key=lambda x: x[1])
         voltage = 33 if p_mw <= 10.0 else 132
         
-        # WDPA LineString Footprint Check (Methodology Fix)
         wdpa = ee.FeatureCollection('WCMC/WDPA/current/polygons')
         project_line = ee.Geometry.LineString([[intake_lng, intake_lat], [ph_lng, ph_lat]])
         within_wdpa = wdpa.filterBounds(project_line).size().getInfo() > 0
@@ -231,7 +244,7 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         if capex_data['Per_MW'] > 13.0 and flag == "GREEN": flag, reason = "AMBER", f"CAPEX Outlier Projections (₹{capex_data['Per_MW']:.2f} Cr/MW)"
 
         mnre_cfa = min(30.0, 3.6 * p_mw)
-        dscr_est = (annual_mwh * 4.50 / 10000000) / ((capex_data['Total'] * 0.70) * 0.0975 / (1 - (1.0975)**-15)) # Simple DSCR at 4.5 INR/kWh, 70:30 debt, 9.75% 15yr
+        dscr_est = (annual_mwh * 4.50 / 10000000) / ((capex_data['Total'] * 0.70) * 0.0975 / (1 - (1.0975)**-15))
 
         return {"intake_lat": intake_lat, "intake_lng": intake_lng, "ph_lat": ph_lat, "ph_lng": ph_lng,
                 "elev_intake": elev_in, "elev_ph": elev_p, "catchment_km2": catchment_km2,
@@ -244,25 +257,21 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
     except Exception as ex:
         return {"error": str(ex)}
 
-# 5. State Machine & Map Centering
+# 5. Initialization
 if "workflow_state" not in st.session_state:
     st.session_state["workflow_state"] = "AWAITING_INTAKE"
     st.session_state["site_data"] = {}
 
 sd = st.session_state["site_data"]
-map_center = [28.0, 94.5]
-map_zoom = 7
-
-if "intake_lat" in sd and "ph_lat" not in sd: map_center, map_zoom = [sd["intake_lat"], sd["intake_lng"]], 13
-elif "ph_lat" in sd and "intake_lat" not in sd: map_center, map_zoom = [sd["ph_lat"], sd["ph_lng"]], 13
-elif "intake_lat" in sd and "ph_lat" in sd: map_center, map_zoom = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2], 12
 
 # 6. User Interface Layout
 col_map, col_dash = st.columns([0.55, 0.45])
 
 with col_map:
     st.subheader("Interactive Basin Triage Map")
-    m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
+    
+    # Initialize Map with Persistent Dynamic Coordinates
+    m = folium.Map(location=st.session_state["map_center"], zoom_start=st.session_state["map_zoom"], tiles=None)
     
     folium.TileLayer(tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}", attr="Google", name="High-Res Satellite Hybrid", show=True).add_to(m)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", show=False).add_to(m)
@@ -281,14 +290,23 @@ with col_map:
 
     folium.LayerControl(position="topright").add_to(m)
     
-    # Map click detection
-    map_output = st_folium(m, width="100%", height=650, key="prospector_map", returned_objects=["last_clicked", "last_object_clicked"])
+    # Render Map & Track Live Interactions
+    map_output = st_folium(m, width="100%", height=650, key="prospector_map", returned_objects=["last_clicked", "last_object_clicked", "center", "zoom"])
     
     if map_output:
+        # Preserve user pan & zoom dynamically unless we force a focus
+        if not st.session_state.get("force_map_update"):
+            if map_output.get("center"):
+                st.session_state["map_center"] = [map_output["center"]["lat"], map_output["center"]["lng"]]
+            if map_output.get("zoom"):
+                st.session_state["map_zoom"] = map_output["zoom"]
+        else:
+            st.session_state["force_map_update"] = False
+
         obj_click = map_output.get("last_object_clicked")
         map_click = map_output.get("last_clicked")
         
-        # Object click detection (Bug 2 Fix: checking both lat AND lng)
+        # Object Click (Enter Relocation Mode)
         if obj_click and st.session_state.get("last_obj_click") != obj_click:
             st.session_state["last_obj_click"] = obj_click
             c_lat, c_lng = obj_click["lat"], obj_click["lng"]
@@ -302,7 +320,7 @@ with col_map:
                 st.session_state["workflow_state"] = "RELOCATE_POWERHOUSE"
                 st.rerun()
                 
-        # Map click drop logic
+        # Map Click (Drop Pin & Zoom)
         elif map_click and st.session_state.get("last_processed_click") != map_click:
             st.session_state["last_processed_click"] = map_click
             click_lat, click_lng = map_click["lat"], map_click["lng"]
@@ -310,6 +328,7 @@ with col_map:
             if st.session_state["workflow_state"] in ["AWAITING_INTAKE", "CONFIRM_INTAKE", "RELOCATE_INTAKE"]:
                 push_state_to_history()
                 if process_intake(click_lat, click_lng):
+                    force_map_focus(sd["intake_lat"], sd["intake_lng"])  # Zooms into snapped intake
                     if "ph_lat" in sd:
                         res = process_calculations(st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"], st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"])
                         if "error" not in res:
@@ -320,10 +339,12 @@ with col_map:
             elif st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "RELOCATE_POWERHOUSE"]:
                 push_state_to_history()
                 res = process_calculations(sd["intake_lat"], sd["intake_lng"], sd["catchment_km2"], click_lat, click_lng)
-                if "error" in res: st.error(res["error"])
+                if "error" in res: 
+                    st.error(res["error"])
                 else:
                     st.session_state["site_data"] = res
                     st.session_state["workflow_state"] = "COMPLETE"
+                    force_map_focus(click_lat, click_lng) # Zooms into powerhouse
                     st.rerun()
 
 with col_dash:
@@ -364,17 +385,21 @@ with col_dash:
             
             if p_in_lat and p_in_lng:
                 if not (p_ph_lat and p_ph_lng):
-                    if process_intake(p_in_lat, p_in_lng): st.rerun()
+                    if process_intake(p_in_lat, p_in_lng): 
+                        force_map_focus(sd["intake_lat"], sd["intake_lng"])
+                        st.rerun()
                 else:
                     if "catchment_km2" not in sd: process_intake(p_in_lat, p_in_lng)
                     res = process_calculations(p_in_lat, p_in_lng, st.session_state["site_data"].get("catchment_km2", 100), p_ph_lat, p_ph_lng)
-                    if "error" in res: st.error(res["error"])
+                    if "error" in res: 
+                        st.error(res["error"])
                     else:
                         st.session_state["site_data"] = res
                         st.session_state["workflow_state"] = "COMPLETE"
+                        force_map_focus(p_ph_lat, p_ph_lng)
                         st.rerun()
             else:
-                st.error("Invalid coordinate string provided.")
+                st.error("Invalid coordinate string provided. Ensure it matches format 27°54'16\"N 94°06'07\"E")
 
     if st.session_state["workflow_state"] != "AWAITING_INTAKE":
         rc1, rc2 = st.columns(2)
