@@ -10,12 +10,12 @@ import json
 import datetime
 import re
 import copy
+import os
 from math import radians, sin, cos, sqrt, atan2, pi
 
-# 1. Page Configuration & CSS Fixes (Restored native background)
+# 1. Page Configuration & CSS Fixes
 st.set_page_config(layout="wide", page_title="Sahaj Urja Site Prospector", initial_sidebar_state="collapsed")
 
-# Only keeping the CSS required to fix the cut-off numbers on the metrics
 st.markdown("""
 <style>
 [data-testid="stMetricValue"] {
@@ -80,8 +80,7 @@ def pop_state_from_history():
         st.session_state["last_obj_click"] = None
 
 st.sidebar.header("Map Navigation")
-undo_btn = st.sidebar.button("↩️ Undo Last Action (Ctrl + Z)", use_container_width=True)
-if undo_btn:
+if st.sidebar.button("↩️ Undo Last Action (Ctrl + Z)", use_container_width=True):
     pop_state_from_history()
     st.rerun()
 
@@ -103,32 +102,26 @@ cfg_gemini_model = st.sidebar.selectbox("Gemini Model Version", ["gemini-2.5-pro
 def parse_combined_coords(coord_str):
     if not coord_str: return None, None
     coord_str = str(coord_str).strip()
-    
     cleaned = coord_str.replace("''", '"').replace('°', ' ').replace("'", ' ').replace('"', ' ').strip()
     matches = re.findall(r'(\d+)\s+(\d+)\s+([\d\.]+)\s*([NSEWnsew])', cleaned)
     
     if len(matches) >= 2:
         lat_dd = float(matches[0][0]) + float(matches[0][1])/60.0 + float(matches[0][2])/3600.0
         if matches[0][3].upper() in ['S', 'W']: lat_dd = -lat_dd
-        
         lng_dd = float(matches[1][0]) + float(matches[1][1])/60.0 + float(matches[1][2])/3600.0
         if matches[1][3].upper() in ['S', 'W']: lng_dd = -lng_dd
         return lat_dd, lng_dd
-    
     try:
         parts = [p for p in re.split(r'[,\s]+', coord_str) if p]
-        if len(parts) >= 2:
-            return float(parts[0]), float(parts[1])
-    except:
-        pass
+        if len(parts) >= 2: return float(parts[0]), float(parts[1])
+    except: pass
     return None, None
 
 def format_dms(dd, is_lat):
     if dd is None: return ""
     direction = ('N' if dd >= 0 else 'S') if is_lat else ('E' if dd >= 0 else 'W')
     dd = abs(dd)
-    d = int(dd)
-    m = int((dd - d) * 60)
+    d, m = int(dd), int((dd - int(dd)) * 60)
     s = (dd - d - m/60) * 3600
     return f"{d}°{m}'{s:.2f}\"{direction}"
 
@@ -154,9 +147,10 @@ def compute_capex(mw, penstock_m, transmission_km, road_km, is_apst):
     subtotal = civil + em + penstock + transmission + road + land + predev
     contingency = 0.10 * subtotal
     total = subtotal + contingency
-    return {'civil': civil, 'em': em, 'penstock': penstock, 'transmission': transmission,
-            'road': road, 'land': land, 'predev': predev, 'contingency': contingency,
-            'total': total, 'per_mw': total / mw if mw > 0 else 0}
+    return {'Civil Works': civil, 'Electro-Mechanical': em, 'Penstock': penstock, 
+            'Transmission': transmission, 'Access Roads': road, 'Land Acquisition': land, 
+            'Pre-Dev / Clearances': predev, 'Contingency': contingency,
+            'Total': total, 'Per_MW': total / mw if mw > 0 else 0}
 
 def process_intake(click_lat, click_lng):
     pt = ee.Geometry.Point([click_lng, click_lat])
@@ -168,7 +162,14 @@ def process_intake(click_lat, click_lng):
             clipped = merit_hydro.select('upa').clip(buffer)
             max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
             if max_dict and max_dict.get('upa') and max_dict.get('upa') >= 10.0:
-                upa_val = max_dict.get('upa')
+                # Snap coordinates to the max pixel (Bug 1 Fix)
+                max_upa = max_dict.get('upa')
+                max_pixel_img = clipped.where(clipped.eq(max_upa), 1).selfMask()
+                vectors = max_pixel_img.reduceToVectors(geometry=buffer, scale=90, geometryType='centroid')
+                snapped_coords = vectors.first().geometry().coordinates().getInfo()
+                click_lng, click_lat = snapped_coords[0], snapped_coords[1]
+                upa_val = max_upa
+                st.toast("Pin snapped to nearest high-flow channel.")
         
         if upa_val and upa_val >= 10.0:
             st.session_state["site_data"]["intake_lat"] = click_lat
@@ -201,7 +202,8 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2000-01-01', '2024-12-31').filter(ee.Filter.calendarRange(1, 3, 'month'))
         mean_lean_daily = chirps.mean().reduceRegion(ee.Reducer.mean(), ee.Geometry.Point([intake_lng, intake_lat]).buffer(5000), 5500).get('precipitation').getInfo()
         
-        effective_plf = cfg_default_plf * 0.5 if (mean_lean_daily and (mean_lean_daily * 30.0) < 40.0) else cfg_default_plf
+        # 40% PLF adjustment for lean season (Bug/Math Fix)
+        effective_plf = cfg_default_plf * 0.4 if (mean_lean_daily and (mean_lean_daily * 30.0) < 40.0) else cfg_default_plf
         annual_mwh = p_mw * 8760.0 * effective_plf
         
         straight_line_km = haversine_km(intake_lat, intake_lng, ph_lat, ph_lng)
@@ -214,17 +216,22 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
         near_sub, near_dist = min(distances, key=lambda x: x[1])
         voltage = 33 if p_mw <= 10.0 else 132
         
+        # WDPA LineString Footprint Check (Methodology Fix)
         wdpa = ee.FeatureCollection('WCMC/WDPA/current/polygons')
-        within_wdpa = wdpa.filterBounds(ee.Geometry.Point([intake_lng, intake_lat])).size().getInfo() > 0
+        project_line = ee.Geometry.LineString([[intake_lng, intake_lat], [ph_lng, ph_lat]])
+        within_wdpa = wdpa.filterBounds(project_line).size().getInfo() > 0
         
-        if within_wdpa: flag, reason = "RED", "WDPA Protected Area Exclusion Area"
+        if within_wdpa: flag, reason = "RED", "WDPA Protected Area Exclusion (Alignment intersects reserve)"
         elif p_mw < cfg_min_mw: flag, reason = "RED", f"Below Policy Target Threshold ({p_mw:.2f} MW < {cfg_min_mw} MW)"
         elif p_mw > cfg_max_mw: flag, reason = "AMBER", f"Exceeds Target Ceiling Profile ({p_mw:.2f} MW > {cfg_max_mw} MW)"
         elif near_dist > cfg_substation_limit: flag, reason = "AMBER", f"Grid Isolation Warning ({near_dist:.1f} km > {cfg_substation_limit} km)"
         else: flag, reason = "GREEN", "Optimal Hydrological & Civil Target Envelope"
             
         capex_data = compute_capex(p_mw, penstock_m, near_dist, cfg_road_km, cfg_is_apst)
-        if capex_data['per_mw'] > 13.0 and flag == "GREEN": flag, reason = "AMBER", f"CAPEX Outlier Projections (₹{capex_data['per_mw']:.2f} Cr/MW)"
+        if capex_data['Per_MW'] > 13.0 and flag == "GREEN": flag, reason = "AMBER", f"CAPEX Outlier Projections (₹{capex_data['Per_MW']:.2f} Cr/MW)"
+
+        mnre_cfa = min(30.0, 3.6 * p_mw)
+        dscr_est = (annual_mwh * 4.50 / 10000000) / ((capex_data['Total'] * 0.70) * 0.0975 / (1 - (1.0975)**-15)) # Simple DSCR at 4.5 INR/kWh, 70:30 debt, 9.75% 15yr
 
         return {"intake_lat": intake_lat, "intake_lng": intake_lng, "ph_lat": ph_lat, "ph_lng": ph_lng,
                 "elev_intake": elev_in, "elev_ph": elev_p, "catchment_km2": catchment_km2,
@@ -233,7 +240,7 @@ def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
                 "penstock_dia_mm": penstock_dia_mm, "turbine_type": turbine_type, "num_units": num_units,
                 "nearest_substation": near_sub, "substation_km": near_dist, "voltage_kv": voltage,
                 "within_wdpa": within_wdpa, "flag": flag, "flag_reason": reason, "capex": capex_data,
-                "specific_yield": specific_yield}
+                "specific_yield": specific_yield, "mnre_cfa_cr": mnre_cfa, "dscr": dscr_est}
     except Exception as ex:
         return {"error": str(ex)}
 
@@ -242,15 +249,13 @@ if "workflow_state" not in st.session_state:
     st.session_state["workflow_state"] = "AWAITING_INTAKE"
     st.session_state["site_data"] = {}
 
-map_center, map_zoom = [28.0, 94.5], 7
 sd = st.session_state["site_data"]
+map_center = [28.0, 94.5]
+map_zoom = 7
 
-if "intake_lat" in sd and "ph_lat" not in sd:
-    map_center, map_zoom = [sd["intake_lat"], sd["intake_lng"]], 13
-elif "ph_lat" in sd and "intake_lat" not in sd:
-    map_center, map_zoom = [sd["ph_lat"], sd["ph_lng"]], 13
-elif "intake_lat" in sd and "ph_lat" in sd:
-    map_center, map_zoom = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2], 12
+if "intake_lat" in sd and "ph_lat" not in sd: map_center, map_zoom = [sd["intake_lat"], sd["intake_lng"]], 13
+elif "ph_lat" in sd and "intake_lat" not in sd: map_center, map_zoom = [sd["ph_lat"], sd["ph_lng"]], 13
+elif "intake_lat" in sd and "ph_lat" in sd: map_center, map_zoom = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2], 12
 
 # 6. User Interface Layout
 col_map, col_dash = st.columns([0.55, 0.45])
@@ -259,71 +264,59 @@ with col_map:
     st.subheader("Interactive Basin Triage Map")
     m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
     
-    # Layer Overrides (Google Hybrid as Default)
-    folium.TileLayer(
-        tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-        attr="Google", name="High-Res Satellite Hybrid (Labels + Borders)", show=True
-    ).add_to(m)
+    folium.TileLayer(tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}", attr="Google", name="High-Res Satellite Hybrid", show=True).add_to(m)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", show=False).add_to(m)
     
-    # Crosshair cursor injection
     if st.session_state["workflow_state"] in ["RELOCATE_INTAKE", "RELOCATE_POWERHOUSE"]:
         m.get_root().html.add_child(folium.Element("<style>.leaflet-container { cursor: crosshair !important; }</style>"))
     
-    # Substations off by default
     substation_group = folium.FeatureGroup(name="18 Verified Substation Radii", show=False).add_to(m)
     for name, s_lat, s_lng in SUBSTATIONS:
         folium.Marker([s_lat, s_lng], tooltip=f"Substation: {name}", icon=folium.Icon(color="orange", icon="flash")).add_to(substation_group)
         folium.Circle([s_lat, s_lng], radius=cfg_substation_limit * 1000, color="orange", fill=False, dash_array="5, 5").add_to(substation_group)
         
-    if "intake_lat" in sd:
-        folium.Marker([sd["intake_lat"], sd["intake_lng"]], tooltip="Click to Relocate Intake Pin", popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
-    if "ph_lat" in sd:
-        folium.Marker([sd["ph_lat"], sd["ph_lng"]], tooltip="Click to Relocate Powerhouse Pin", popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
-    
-    if "intake_lat" in sd and "ph_lat" in sd:
-        folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
+    if "intake_lat" in sd: folium.Marker([sd["intake_lat"], sd["intake_lng"]], tooltip="Click to Relocate Intake Pin", popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
+    if "ph_lat" in sd: folium.Marker([sd["ph_lat"], sd["ph_lng"]], tooltip="Click to Relocate Powerhouse Pin", popup="Proposed Powerhouse", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
+    if "intake_lat" in sd and "ph_lat" in sd: folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
 
     folium.LayerControl(position="topright").add_to(m)
     
-    # Capture Map & Object Clicks
-    map_output = st_folium(m, width="100%", height=650, key="prospector_map")
+    # Map click detection
+    map_output = st_folium(m, width="100%", height=650, key="prospector_map", returned_objects=["last_clicked", "last_object_clicked"])
     
     if map_output:
         obj_click = map_output.get("last_object_clicked")
         map_click = map_output.get("last_clicked")
         
-        # 1. Did the user click an existing pin? (Enter Relocation Mode)
+        # Object click detection (Bug 2 Fix: checking both lat AND lng)
         if obj_click and st.session_state.get("last_obj_click") != obj_click:
             st.session_state["last_obj_click"] = obj_click
-            c_lat = obj_click["lat"]
+            c_lat, c_lng = obj_click["lat"], obj_click["lng"]
             
-            if "intake_lat" in sd and abs(sd["intake_lat"] - c_lat) < 0.005:
+            if "intake_lat" in sd and abs(sd["intake_lat"] - c_lat) < 0.005 and abs(sd["intake_lng"] - c_lng) < 0.005:
                 push_state_to_history()
                 st.session_state["workflow_state"] = "RELOCATE_INTAKE"
                 st.rerun()
-            elif "ph_lat" in sd and abs(sd["ph_lat"] - c_lat) < 0.005:
+            elif "ph_lat" in sd and abs(sd["ph_lat"] - c_lat) < 0.005 and abs(sd["ph_lng"] - c_lng) < 0.005:
                 push_state_to_history()
                 st.session_state["workflow_state"] = "RELOCATE_POWERHOUSE"
                 st.rerun()
                 
-        # 2. Did the user click the map? (Drop the pin)
+        # Map click drop logic
         elif map_click and st.session_state.get("last_processed_click") != map_click:
             st.session_state["last_processed_click"] = map_click
             click_lat, click_lng = map_click["lat"], map_click["lng"]
             
-            # Dropping an Intake Pin
             if st.session_state["workflow_state"] in ["AWAITING_INTAKE", "CONFIRM_INTAKE", "RELOCATE_INTAKE"]:
                 push_state_to_history()
                 if process_intake(click_lat, click_lng):
                     if "ph_lat" in sd:
-                        res = process_calculations(click_lat, click_lng, st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"])
+                        res = process_calculations(st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"], st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"])
                         if "error" not in res:
                             st.session_state["site_data"] = res
                             st.session_state["workflow_state"] = "COMPLETE"
                     st.rerun()
                     
-            # Dropping a Powerhouse Pin
             elif st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "RELOCATE_POWERHOUSE"]:
                 push_state_to_history()
                 res = process_calculations(sd["intake_lat"], sd["intake_lng"], sd["catchment_km2"], click_lat, click_lng)
@@ -336,7 +329,6 @@ with col_map:
 with col_dash:
     st.subheader("Coordinate Engine & Evaluation Module")
     
-    # Dynamic Contextual Instructions
     if st.session_state["workflow_state"] == "AWAITING_INTAKE":
         st.info("Action Required: Click the map to plot the Intake, OR enter precise coordinates below.")
         
@@ -353,17 +345,15 @@ with col_dash:
         st.info("Action Required: Click the map to drop the Powerhouse pin, OR enter precise coordinates below.")
         
     elif st.session_state["workflow_state"] == "RELOCATE_INTAKE":
-        st.warning("📍 RELOCATION MODE: The map cursor is a crosshair. Click anywhere on the map to drop the INTAKE pin at its new location.")
+        st.warning("📍 RELOCATION MODE: Click anywhere on the map to drop the INTAKE pin.")
         
     elif st.session_state["workflow_state"] == "RELOCATE_POWERHOUSE":
-        st.warning("📍 RELOCATION MODE: The map cursor is a crosshair. Click anywhere on the map to drop the POWERHOUSE pin at its new location.")
+        st.warning("📍 RELOCATION MODE: Click anywhere on the map to drop the POWERHOUSE pin.")
 
-    # Manual Input Box
     with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] in ["AWAITING_INTAKE", "AWAITING_POWERHOUSE"])):
         in_coord_val = st.text_input("Intake Coordinates", value=format_combined_dms(sd.get("intake_lat"), sd.get("intake_lng")), placeholder="27°54'16.27\"N 94°06'07.18\"E")
         
         ph_coord_val = ""
-        # Only display the Powerhouse coordinate input if Intake is locked or Complete
         if st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "COMPLETE", "RELOCATE_POWERHOUSE", "RELOCATE_INTAKE"]:
             ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
         
@@ -384,21 +374,18 @@ with col_dash:
                         st.session_state["workflow_state"] = "COMPLETE"
                         st.rerun()
             else:
-                st.error("Invalid coordinate string provided. Ensure it matches format 27°54'16\"N 94°06'07\"E")
+                st.error("Invalid coordinate string provided.")
 
     if st.session_state["workflow_state"] != "AWAITING_INTAKE":
         rc1, rc2 = st.columns(2)
         if rc1.button("Reset Intake Node"):
             push_state_to_history()
-            st.session_state["site_data"].pop("intake_lat", None)
-            st.session_state["site_data"].pop("intake_lng", None)
-            st.session_state["site_data"].pop("catchment_km2", None)
+            st.session_state["site_data"].pop("intake_lat", None); st.session_state["site_data"].pop("intake_lng", None); st.session_state["site_data"].pop("catchment_km2", None)
             st.session_state["workflow_state"] = "AWAITING_INTAKE"
             st.rerun()
         if rc2.button("Reset Powerhouse Node"):
             push_state_to_history()
-            st.session_state["site_data"].pop("ph_lat", None)
-            st.session_state["site_data"].pop("ph_lng", None)
+            st.session_state["site_data"].pop("ph_lat", None); st.session_state["site_data"].pop("ph_lng", None)
             st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
             st.rerun()
 
@@ -414,47 +401,64 @@ with col_dash:
         m1, m2, m3 = st.columns(3)
         m1.metric("Capacity", f"{sd['capacity_MW']:.2f} MW")
         m2.metric("Annual Gen", f"{sd['annual_MWh']:.0f} MWh")
-        m3.metric("CAPEX / MW", f"₹{sd['capex']['per_mw']:.2f} Cr")
+        m3.metric("CAPEX / MW", f"₹{sd['capex']['Per_MW']:.2f} Cr")
         
-        st.markdown("### Engineering Parameters")
-        st.write(f"**Catchment Area:** {sd['catchment_km2']:.2f} sq km  |  **Design Flow (Q):** {sd['q_design_cumecs']:.2f} m³/s")
-        st.write(f"**Gross Head:** {sd['gross_head_m']:.1f} m  |  **Net Design Head:** {sd['net_head_m']:.1f} m")
-        st.write(f"**Penstock Profile:** {sd['penstock_m']:.0f} m (Dia: {sd['penstock_dia_mm']} mm) | Type: {sd['num_units']}x {sd['turbine_type']}")
-        st.write(f"**Grid Connection:** {sd['nearest_substation']} Substation at {sd['substation_km']:.1f} km ({sd['voltage_kv']} kV)")
+        st.write(f"**MNRE Subsidy Estimate:** ₹{sd['mnre_cfa_cr']:.2f} Cr  |  **Est. DSCR (15yr):** {sd['dscr']:.2f}x")
         
-        river_input = st.text_input("River / Stream Identification Mapping Name")
-        action_col1, action_col2, action_col3 = st.columns(3)
+        with st.expander("Show CAPEX Breakdown", expanded=False):
+            capex_df = pd.DataFrame(list(sd['capex'].items()), columns=["Category", "Amount (₹ Cr)"]).set_index("Category")
+            st.dataframe(capex_df.style.format("₹ {:.2f} Cr"), use_container_width=True)
+
+        river_input = st.text_input("River / Project Name")
+        notes_input = st.text_area("Field Notes / Risks")
         
-        if action_col2.button("Synthesize Report", use_container_width=True):
-            with st.spinner("Compiling Desktop Pre-Feasibility Note via Gemini API..."):
+        action_col1, action_col2 = st.columns(2)
+        
+        if action_col1.button("Save Entry to Log Database", use_container_width=True):
+            log_row = {
+                "Timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), "Project_Name": river_input,
+                "Intake_Coords": format_combined_dms(sd["intake_lat"], sd["intake_lng"]), 
+                "PH_Coords": format_combined_dms(sd["ph_lat"], sd["ph_lng"]),
+                "Catchment_km2": round(sd["catchment_km2"], 1), "Gross_Head_m": round(sd["gross_head_m"], 1),
+                "Capacity_MW": round(sd["capacity_MW"], 2), "Annual_MWh": round(sd["annual_MWh"], 0),
+                "CAPEX_Per_MW_Cr": round(sd['capex']["Per_MW"], 2), "MNRE_CFA_Cr": round(sd["mnre_cfa_cr"], 2),
+                "Flag": sd["flag"], "Notes": notes_input, "LLM_Note_Attached": "feasibility_note" in st.session_state
+            }
+            file_exists = os.path.exists("site_log.csv")
+            pd.DataFrame([log_row]).to_csv("site_log.csv", mode='a', header=not file_exists, index=False)
+            st.success("Record appended successfully to site_log.csv.")
+
+        if action_col2.button("Synthesize Full Report", use_container_width=True):
+            with st.spinner("Compiling Note via Gemini API..."):
                 model = genai.GenerativeModel(cfg_gemini_model)
                 site_context_payload = {
-                    "topography": {"catchment_sq_km": sd["catchment_km2"], "gross_head_m": sd["gross_head_m"], "net_head_m": sd["net_head_m"]},
+                    "topography": {"catchment_sq_km": sd["catchment_km2"], "gross_head_m": sd["gross_head_m"], "net_head_m": sd["net_head_m"], "wdpa_intersection": sd["within_wdpa"]},
                     "hydrology": {"design_flow_cumecs": sd["q_design_cumecs"], "specific_yield": sd["specific_yield"], "projected_annual_generation_mwh": sd["annual_MWh"]},
                     "electro_mechanical": {"capacity_mw": sd["capacity_MW"], "turbine_type": sd["turbine_type"], "unit_count": sd["num_units"]},
-                    "infrastructure": {"penstock_length_m": sd["penstock_m"], "nearest_substation": sd["nearest_substation"], "interconnection_distance_km": sd["substation_km"]},
-                    "financials": {"total_capex_cr": sd['capex']["total"], "capex_per_mw_cr": sd['capex']["per_mw"], "mnre_subsidy_eligibility_cr": min(30.0, 3.6 * sd["capacity_MW"])}
+                    "infrastructure": {"penstock_length_m": sd["penstock_m"], "nearest_substation": sd["nearest_substation"], "interconnection_distance_km": sd["substation_km"], "voltage_kv": sd["voltage_kv"]},
+                    "financials": sd['capex'], "triage_flag": sd['flag']
                 }
                 
                 prompt = f"""
-                You are a senior technical lead engineer. Construct an exhaustive, professional Desktop Pre-Feasibility Note based strictly upon the provided raw engineering calculations payload below. 
+                You are a senior technical lead engineer. Construct an exhaustive, professional Desktop Pre-Feasibility Note based strictly upon the provided raw engineering payload below. 
                 RAW CALCULATIONS PAYLOAD:
                 {json.dumps(site_context_payload, indent=2)}
                 
-                Explicitly label the header note exactly as follows:
+                Explicitly label the header exactly as follows:
                 # DESKTOP PRE-FEASIBILITY NOTE
                 ## ⚠️ UNVERIFIED DESKTOP ANALYSIS — NOT A FORMAL SALIENT FEATURES DOCUMENT
-                **Estimates based on remote sensing and parametric models. Field validation required before any commitment.**
+                **Estimates based on remote sensing and parametric models. Field validation required.**
                 
-                Compile 8 explicit sections containing deep analytical prose based on the data:
-                   - SECTION 1: LOCATION & GEOSPATIAL BOUNDARIES
-                   - SECTION 2: HYDROLOGICAL PROFILE & INFRASTRUCTURE CONSTRAINTS
-                   - SECTION 3: CIVIL WORKS CONFIGURATION PARAMETERS
-                   - SECTION 4: POWER GENERATION SCHEMATIC & EQUIPMENT DESIGN SELECTION
-                   - SECTION 5: GRID INTERCONNECTION & POWER EVACUATION ANALYSIS
-                   - SECTION 6: ECONOMIC FEASIBILITY & DEVELOPMENT ROADMAP
-                   - SECTION 7: FIELD VALIDATION CRITICAL CHECKLIST
-                   - SECTION 8: CAVEATS & TECHNICAL LIMITATIONS
+                Compile 8 explicit sections containing analytical prose based on the data:
+                   - SECTION 1: LOCATION & BOUNDARIES
+                   - SECTION 2: HYDROLOGICAL PROFILE & CONSTRAINTS
+                   - SECTION 3: CIVIL WORKS CONFIGURATION
+                   - SECTION 4: POWER GENERATION SCHEMATIC
+                   - SECTION 5: GRID INTERCONNECTION ANALYSIS
+                   - SECTION 6: ECONOMIC FEASIBILITY
+                   - SECTION 7: FIELD VALIDATION CRITICAL CHECKLIST (CRITICAL: You must explicitly list these 12 validation points: Catchment verification by current meter, head verification via DGPS, sediment/bedload assessment, customary clan land rights, APEDA allotment status, cumulative basin allocation, forest classification check, geotechnical assessment, grid reliability, road access, and local community sentiment).
+                   - SECTION 8: CAVEATS
+                DO NOT FABRICATE COORDINATES OR DATA NOT PROVIDED.
                 """
                 response = model.generate_content(prompt)
                 st.session_state["feasibility_note"] = response.text
@@ -464,7 +468,15 @@ with col_dash:
             st.markdown(st.session_state["feasibility_note"])
             st.download_button("Download MD", data=st.session_state["feasibility_note"], file_name=f"Sahaj_Urja_PFN_{river_input or 'Unassigned'}.md")
 
-# HTML/JS Injection for Ctrl+Z Global Shortcut
+# 7. Site Log Viewer
+with st.expander("View Local Site Log Database (site_log.csv)", expanded=False):
+    if os.path.exists("site_log.csv"):
+        log_df = pd.read_csv("site_log.csv")
+        st.dataframe(log_df, use_container_width=True)
+        st.download_button("Export CSV", data=log_df.to_csv(index=False), file_name="sahaj_urja_site_log.csv", mime="text/csv")
+    else:
+        st.info("No sites saved yet.")
+
 components.html(
     """
     <script>
