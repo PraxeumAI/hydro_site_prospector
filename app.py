@@ -163,7 +163,8 @@ def process_intake(click_lat, click_lng):
             max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
             if max_dict and max_dict.get('upa') and max_dict.get('upa') >= 10.0:
                 max_upa = max_dict.get('upa')
-                max_pixel_img = clipped.where(clipped.eq(max_upa), 1).selfMask()
+                # FIX: Explicitly cast to integer to prevent reduceToVectors crash
+                max_pixel_img = ee.Image.constant(1).toInt().updateMask(clipped.eq(max_upa))
                 vectors = max_pixel_img.reduceToVectors(geometry=buffer, scale=90, geometryType='centroid')
                 snapped_coords = vectors.first().geometry().coordinates().getInfo()
                 click_lng, click_lat = snapped_coords[0], snapped_coords[1]
