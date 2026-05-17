@@ -12,122 +12,21 @@ import re
 import copy
 from math import radians, sin, cos, sqrt, atan2, pi
 
-# 1. Page Configuration & Professional CSS Overhaul
+# 1. Page Configuration & CSS Fixes (Restored native background)
 st.set_page_config(layout="wide", page_title="Sahaj Urja Site Prospector", initial_sidebar_state="collapsed")
 
+# Only keeping the CSS required to fix the cut-off numbers on the metrics
 st.markdown("""
 <style>
-    /* App Background */
-    .stApp {
-        background-color: #f8fafc;
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
-    }
-    
-    /* Headers */
-    h1, h2, h3 {
-        color: #0f172a;
-        font-weight: 600 !important;
-    }
-    
-    /* Metric Cards Styling */
-    [data-testid="stMetric"] {
-        background-color: #ffffff;
-        border-radius: 10px;
-        padding: 15px 20px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-        border: 1px solid #e2e8f0;
-    }
-    [data-testid="stMetricLabel"] {
-        color: #64748b !important;
-        font-weight: 600 !important;
-        font-size: 0.95rem !important;
-    }
-    [data-testid="stMetricValue"] {
-        font-size: 1.8rem !important;
-        font-weight: 700 !important;
-        color: #1e293b !important;
-        white-space: nowrap !important;
-        overflow: visible !important;
-    }
-
-    /* Expander Styling */
-    .streamlit-expanderHeader {
-        background-color: #ffffff;
-        border-radius: 8px;
-        border: 1px solid #e2e8f0;
-        font-weight: 500;
-        color: #334155;
-    }
-    
-    /* Button Styling */
-    .stButton>button {
-        border-radius: 8px;
-        font-weight: 600;
-        padding: 0.5rem 1rem;
-        transition: all 0.2s ease;
-        border: 1px solid #cbd5e1;
-    }
-    .stButton>button:hover {
-        border-color: #3b82f6;
-        color: #3b82f6;
-        box-shadow: 0 2px 4px rgba(59, 130, 246, 0.1);
-    }
-    
-    /* Primary Button Override */
-    .stButton>button[kind="primary"] {
-        background-color: #2563eb;
-        color: white;
-        border: none;
-    }
-    .stButton>button[kind="primary"]:hover {
-        background-color: #1d4ed8;
-        color: white;
-    }
-
-    /* Map Container Shadow */
-    iframe {
-        border-radius: 12px;
-        box-shadow: 0 4px 10px rgba(0,0,0,0.08);
-        border: 1px solid #e2e8f0;
-    }
-    
-    /* Custom Status Banners */
-    .status-banner {
-        padding: 16px;
-        border-radius: 8px;
-        color: white;
-        font-weight: 600;
-        font-size: 1.1rem;
-        text-align: center;
-        margin-bottom: 20px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 10px;
-    }
-    .status-green { background: linear-gradient(135deg, #10b981 0%, #059669 100%); }
-    .status-amber { background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%); }
-    .status-red { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); }
-    
-    /* Info/Warning Box Styling */
-    div.stAlert {
-        border-radius: 8px;
-        border: none;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.02);
-    }
+[data-testid="stMetricValue"] {
+    font-size: 1.6rem !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# Custom Header
-st.markdown("""
-<div style="padding-bottom: 1.5rem; margin-bottom: 1.5rem; border-bottom: 2px solid #e2e8f0;">
-    <h1 style="margin: 0; color: #1e3a8a; display: flex; align-items: center; gap: 12px;">
-        <span style="font-size: 2.5rem;">🌊</span> Sahaj Urja Site Prospector
-    </h1>
-    <p style="margin: 5px 0 0 0; color: #64748b; font-size: 1.1rem; font-weight: 500;">Arunachal Pradesh Run-of-River Triage Dashboard</p>
-</div>
-""", unsafe_allow_html=True)
+st.title("Sahaj Urja Site Prospector — Arunachal Pradesh SHP Triage")
 
 # Initialize GEE
 if "gee_authenticated" not in st.session_state:
@@ -354,13 +253,13 @@ elif "intake_lat" in sd and "ph_lat" in sd:
     map_center, map_zoom = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2], 12
 
 # 6. User Interface Layout
-col_map, col_dash = st.columns([0.55, 0.45], gap="large")
+col_map, col_dash = st.columns([0.55, 0.45])
 
 with col_map:
-    st.markdown("<h3 style='margin-bottom: 15px;'>Geospatial Triage Map</h3>", unsafe_allow_html=True)
+    st.subheader("Interactive Basin Triage Map")
     m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
     
-    # Layer Overrides
+    # Layer Overrides (Google Hybrid as Default)
     folium.TileLayer(
         tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
         attr="Google", name="High-Res Satellite Hybrid (Labels + Borders)", show=True
@@ -383,12 +282,12 @@ with col_map:
         folium.Marker([sd["ph_lat"], sd["ph_lng"]], tooltip="Click to Relocate Powerhouse Pin", popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
     
     if "intake_lat" in sd and "ph_lat" in sd:
-        folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="#3b82f6", weight=5, opacity=0.9, dash_array="6, 6").add_to(m)
+        folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
 
     folium.LayerControl(position="topright").add_to(m)
     
     # Capture Map & Object Clicks
-    map_output = st_folium(m, width="100%", height=680, key="prospector_map")
+    map_output = st_folium(m, width="100%", height=650, key="prospector_map")
     
     if map_output:
         obj_click = map_output.get("last_object_clicked")
@@ -435,39 +334,40 @@ with col_map:
                     st.rerun()
 
 with col_dash:
-    st.markdown("<h3 style='margin-bottom: 15px;'>Evaluation Engine</h3>", unsafe_allow_html=True)
+    st.subheader("Coordinate Engine & Evaluation Module")
     
     # Dynamic Contextual Instructions
     if st.session_state["workflow_state"] == "AWAITING_INTAKE":
-        st.info("🎯 **Action Required:** Click the map to plot the Intake, OR enter precise coordinates below.")
+        st.info("Action Required: Click the map to plot the Intake, OR enter precise coordinates below.")
         
     elif st.session_state["workflow_state"] == "CONFIRM_INTAKE":
-        st.success(f"**Intake pinpointed.** Extracted Catchment: **{sd['catchment_km2']:.1f} sq km**.")
+        st.warning(f"Intake pinpointed. Extracted Catchment: **{sd['catchment_km2']:.1f} sq km**.")
         st.info("⚠️ Is the weir site accurately placed on the map? If not, click the pin to unlock it, then click the map to relocate. Once satisfied, click Lock.")
-        if st.button("Lock Intake Location & Proceed", type="primary", use_container_width=True):
+        if st.button("✅ Lock Intake Location & Proceed", type="primary", use_container_width=True):
             push_state_to_history()
             st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
             st.rerun()
             
     elif st.session_state["workflow_state"] == "AWAITING_POWERHOUSE":
-        st.success("🔒 **Intake locked.**")
-        st.info("🎯 **Action Required:** Click the map to drop the Powerhouse pin, OR enter precise coordinates below.")
+        st.success("Intake locked.")
+        st.info("Action Required: Click the map to drop the Powerhouse pin, OR enter precise coordinates below.")
         
     elif st.session_state["workflow_state"] == "RELOCATE_INTAKE":
-        st.warning("📍 **RELOCATION MODE:** The map cursor is a crosshair. Click anywhere on the map to drop the INTAKE pin at its new location.")
+        st.warning("📍 RELOCATION MODE: The map cursor is a crosshair. Click anywhere on the map to drop the INTAKE pin at its new location.")
         
     elif st.session_state["workflow_state"] == "RELOCATE_POWERHOUSE":
-        st.warning("📍 **RELOCATION MODE:** The map cursor is a crosshair. Click anywhere on the map to drop the POWERHOUSE pin at its new location.")
+        st.warning("📍 RELOCATION MODE: The map cursor is a crosshair. Click anywhere on the map to drop the POWERHOUSE pin at its new location.")
 
     # Manual Input Box
-    with st.expander("⚙️ Manual Coordinate Overrides", expanded=(st.session_state["workflow_state"] in ["AWAITING_INTAKE", "AWAITING_POWERHOUSE"])):
+    with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] in ["AWAITING_INTAKE", "AWAITING_POWERHOUSE"])):
         in_coord_val = st.text_input("Intake Coordinates", value=format_combined_dms(sd.get("intake_lat"), sd.get("intake_lng")), placeholder="27°54'16.27\"N 94°06'07.18\"E")
         
         ph_coord_val = ""
+        # Only display the Powerhouse coordinate input if Intake is locked or Complete
         if st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "COMPLETE", "RELOCATE_POWERHOUSE", "RELOCATE_INTAKE"]:
             ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
         
-        if st.button("Execute Manual Coordinates"):
+        if st.button("Apply Manual Coordinates Engine"):
             push_state_to_history()
             p_in_lat, p_in_lng = parse_combined_coords(in_coord_val)
             p_ph_lat, p_ph_lng = parse_combined_coords(ph_coord_val) if ph_coord_val else (None, None)
@@ -502,12 +402,12 @@ with col_dash:
             st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
             st.rerun()
 
+    st.markdown("---")
     if st.session_state["workflow_state"] == "COMPLETE":
-        st.markdown("<br>", unsafe_allow_html=True)
-        f_class = "status-green" if sd["flag"] == "GREEN" else ("status-amber" if sd["flag"] == "AMBER" else "status-red")
+        f_color = "green" if sd["flag"] == "GREEN" else ("orange" if sd["flag"] == "AMBER" else "red")
         st.markdown(f"""
-        <div class="status-banner {f_class}">
-            { "✅" if sd["flag"] == "GREEN" else "⚠️" } TRIAGE STATUS: {sd['flag']} — {sd['flag_reason']}
+        <div style="background-color: {f_color}; padding: 12px; border-radius: 4px; color: white; font-weight: bold; text-align: center; margin-bottom: 15px;">
+            TRIAGE STATUS: {sd['flag']} — {sd['flag_reason']}
         </div>
         """, unsafe_allow_html=True)
         
@@ -516,28 +416,17 @@ with col_dash:
         m2.metric("Annual Gen", f"{sd['annual_MWh']:.0f} MWh")
         m3.metric("CAPEX / MW", f"₹{sd['capex']['per_mw']:.2f} Cr")
         
-        st.markdown("<br>", unsafe_allow_html=True)
-        with st.container(border=True):
-            st.markdown("#### Engineering Architecture")
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.write(f"**Catchment Area:** {sd['catchment_km2']:.2f} sq km")
-                st.write(f"**Gross Head:** {sd['gross_head_m']:.1f} m")
-                st.write(f"**Net Design Head:** {sd['net_head_m']:.1f} m")
-            with col_b:
-                st.write(f"**Design Flow (Q):** {sd['q_design_cumecs']:.2f} m³/s")
-                st.write(f"**Penstock:** {sd['penstock_m']:.0f} m (Dia: {sd['penstock_dia_mm']} mm)")
-                st.write(f"**Prime Mover:** {sd['num_units']}x {sd['turbine_type']}")
-            
-            st.divider()
-            st.write(f"🔌 **Grid Connection:** {sd['nearest_substation']} Substation at {sd['substation_km']:.1f} km ({sd['voltage_kv']} kV)")
+        st.markdown("### Engineering Parameters")
+        st.write(f"**Catchment Area:** {sd['catchment_km2']:.2f} sq km  |  **Design Flow (Q):** {sd['q_design_cumecs']:.2f} m³/s")
+        st.write(f"**Gross Head:** {sd['gross_head_m']:.1f} m  |  **Net Design Head:** {sd['net_head_m']:.1f} m")
+        st.write(f"**Penstock Profile:** {sd['penstock_m']:.0f} m (Dia: {sd['penstock_dia_mm']} mm) | Type: {sd['num_units']}x {sd['turbine_type']}")
+        st.write(f"**Grid Connection:** {sd['nearest_substation']} Substation at {sd['substation_km']:.1f} km ({sd['voltage_kv']} kV)")
         
-        st.markdown("<br>", unsafe_allow_html=True)
-        river_input = st.text_input("Stream/Project Identification Name")
-        action_col1, action_col2 = st.columns(2)
+        river_input = st.text_input("River / Stream Identification Mapping Name")
+        action_col1, action_col2, action_col3 = st.columns(3)
         
-        if action_col1.button("Synthesize Feasibility Report", type="primary", use_container_width=True):
-            with st.spinner("Compiling Desktop Pre-Feasibility Note via Gemini Engine..."):
+        if action_col2.button("Synthesize Report", use_container_width=True):
+            with st.spinner("Compiling Desktop Pre-Feasibility Note via Gemini API..."):
                 model = genai.GenerativeModel(cfg_gemini_model)
                 site_context_payload = {
                     "topography": {"catchment_sq_km": sd["catchment_km2"], "gross_head_m": sd["gross_head_m"], "net_head_m": sd["net_head_m"]},
@@ -573,7 +462,7 @@ with col_dash:
         if "feasibility_note" in st.session_state:
             st.markdown("---")
             st.markdown(st.session_state["feasibility_note"])
-            st.download_button("Download Markdown Report", data=st.session_state["feasibility_note"], file_name=f"Sahaj_Urja_PFN_{river_input or 'Unassigned'}.md", use_container_width=True)
+            st.download_button("Download MD", data=st.session_state["feasibility_note"], file_name=f"Sahaj_Urja_PFN_{river_input or 'Unassigned'}.md")
 
 # HTML/JS Injection for Ctrl+Z Global Shortcut
 components.html(
