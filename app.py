@@ -269,9 +269,9 @@ with col_map:
         folium.Circle([s_lat, s_lng], radius=cfg_substation_limit * 1000, color="orange", fill=False, dash_array="5, 5").add_to(substation_group)
         
     if "intake_lat" in sd:
-        folium.Marker([sd["intake_lat"], sd["intake_lng"]], popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
+        folium.Marker([sd["intake_lat"], sd["intake_lng"]], popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud"), draggable=True).add_to(m)
     if "ph_lat" in sd:
-        folium.Marker([sd["ph_lat"], sd["ph_lng"]], popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
+        folium.Marker([sd["ph_lat"], sd["ph_lng"]], popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt"), draggable=True).add_to(m)
     
     # Draw line only if BOTH points exist
     if "intake_lat" in sd and "ph_lat" in sd:
@@ -309,7 +309,7 @@ with col_dash:
         
     elif st.session_state["workflow_state"] == "CONFIRM_INTAKE":
         st.warning(f"Intake pinpointed. Extracted Catchment: **{sd['catchment_km2']:.1f} sq km**.")
-        st.info("⚠️ Is the weir site accurately placed on the map? If not, click the map again to adjust the pin. Once satisfied, click Lock.")
+        st.info("⚠️ Is the weir site accurately placed on the map? If not, hover over the pin to drag it, or click the map again to adjust the pin. Once satisfied, click Lock.")
         if st.button("✅ Lock Intake Location & Proceed", type="primary", use_container_width=True):
             push_state_to_history()
             st.session_state["workflow_state"] = "AWAITING_POWERHOUSE"
@@ -321,12 +321,16 @@ with col_dash:
 
     with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] == "AWAITING_INTAKE")):
         in_coord_val = st.text_input("Intake Coordinates", value=format_combined_dms(sd.get("intake_lat"), sd.get("intake_lng")), placeholder="27°54'16.27\"N 94°06'07.18\"E")
-        ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
+        
+        ph_coord_val = ""
+        # Only display the Powerhouse coordinate input if Intake is locked or Complete
+        if st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "COMPLETE"]:
+            ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
         
         if st.button("Apply Manual Coordinates Engine"):
             push_state_to_history()
             p_in_lat, p_in_lng = parse_combined_coords(in_coord_val)
-            p_ph_lat, p_ph_lng = parse_combined_coords(ph_coord_val)
+            p_ph_lat, p_ph_lng = parse_combined_coords(ph_coord_val) if ph_coord_val else (None, None)
             
             if p_in_lat and p_in_lng:
                 if not (p_ph_lat and p_ph_lng):
