@@ -100,11 +100,9 @@ def parse_combined_coords(coord_str):
     if not coord_str: return None, None
     coord_str = str(coord_str).strip()
     
-    # Clean the string for regex processing
     cleaned = coord_str.replace("''", '"').replace('°', ' ').replace("'", ' ').replace('"', ' ').strip()
-    
-    # Try finding explicit DMS patterns (matches Lat and Lng blocks)
     matches = re.findall(r'(\d+)\s+(\d+)\s+([\d\.]+)\s*([NSEWnsew])', cleaned)
+    
     if len(matches) >= 2:
         lat_dd = float(matches[0][0]) + float(matches[0][1])/60.0 + float(matches[0][2])/3600.0
         if matches[0][3].upper() in ['S', 'W']: lat_dd = -lat_dd
@@ -113,7 +111,6 @@ def parse_combined_coords(coord_str):
         if matches[1][3].upper() in ['S', 'W']: lng_dd = -lng_dd
         return lat_dd, lng_dd
     
-    # Fallback for standard decimal format (e.g. "28.5, 94.2" or "28.5 94.2")
     try:
         parts = [p for p in re.split(r'[,\s]+', coord_str) if p]
         if len(parts) >= 2:
@@ -246,6 +243,8 @@ sd = st.session_state["site_data"]
 
 if "intake_lat" in sd and "ph_lat" not in sd:
     map_center, map_zoom = [sd["intake_lat"], sd["intake_lng"]], 13
+elif "ph_lat" in sd and "intake_lat" not in sd:
+    map_center, map_zoom = [sd["ph_lat"], sd["ph_lng"]], 13
 elif "intake_lat" in sd and "ph_lat" in sd:
     map_center, map_zoom = [(sd["intake_lat"] + sd["ph_lat"]) / 2, (sd["intake_lng"] + sd["ph_lng"]) / 2], 12
 
@@ -256,14 +255,14 @@ with col_map:
     st.subheader("Interactive Basin Triage Map")
     m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None)
     
-    # Layer Overrides (Google Hybrid as Default for highly detailed place names & roads over satellite)
+    # Layer Overrides (Google Hybrid as Default)
     folium.TileLayer(
         tiles="https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
         attr="Google", name="High-Res Satellite Hybrid (Labels + Borders)", show=True
     ).add_to(m)
     folium.TileLayer("OpenTopoMap", name="Topographic Relief Map", show=False).add_to(m)
     
-    # Substations off by default to reduce clutter
+    # Substations off by default
     substation_group = folium.FeatureGroup(name="18 Verified Substation Radii", show=False).add_to(m)
     for name, s_lat, s_lng in SUBSTATIONS:
         folium.Marker([s_lat, s_lng], tooltip=f"Substation: {name}", icon=folium.Icon(color="orange", icon="flash")).add_to(substation_group)
@@ -273,12 +272,15 @@ with col_map:
         folium.Marker([sd["intake_lat"], sd["intake_lng"]], popup="Proposed Weir Intake", icon=folium.Icon(color="green", icon="cloud")).add_to(m)
     if "ph_lat" in sd:
         folium.Marker([sd["ph_lat"], sd["ph_lng"]], popup="Proposed Powerhouse Point", icon=folium.Icon(color="red", icon="bolt")).add_to(m)
+    
+    # Draw line only if BOTH points exist
+    if "intake_lat" in sd and "ph_lat" in sd:
         folium.PolyLine([[sd["intake_lat"], sd["intake_lng"]], [sd["ph_lat"], sd["ph_lng"]]], color="blue", weight=4, opacity=0.8, dash_array="6, 6").add_to(m)
 
     folium.LayerControl(position="topright").add_to(m)
     map_output = st_folium(m, width="100%", height=650, key="prospector_map")
     
-    # Click Processing with History Push
+    # Click Processing
     if map_output and map_output.get("last_clicked"):
         click_lat, click_lng = map_output["last_clicked"]["lat"], map_output["last_clicked"]["lng"]
         current_click = (click_lat, click_lng)
