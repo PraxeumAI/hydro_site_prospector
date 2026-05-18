@@ -13,7 +13,7 @@ import copy
 import os
 from math import radians, sin, cos, sqrt, atan2, pi
 
-# 1. Page Configuration & CSS Fixes (Native Background)
+# 1. Page Configuration & CSS Fixes
 st.set_page_config(layout="wide", page_title="Sahaj Urja Site Prospector", initial_sidebar_state="collapsed")
 
 st.markdown("""
@@ -84,15 +84,31 @@ if st.sidebar.button("↩️ Undo Last Action (Ctrl + Z)", use_container_width=T
     pop_state_from_history()
     st.rerun()
 
-st.sidebar.header("Configuration Parameters")
+st.sidebar.header("Engineering Parameters")
+
+# NEW: Design Flow Standard Selector
+design_q_options = {
+    "Q90 (Firm Power)": 0.40,
+    "Q75 (Dependable)": 0.75,
+    "Q60 (Conservative)": 0.90,
+    "Q50 (Typical Design - DEFAULT)": 1.00,
+    "Q40 (Aggressive)": 1.30,
+    "Q25 (Very Aggressive)": 1.70
+}
+cfg_design_q_label = st.sidebar.selectbox("Design Flow Standard", list(design_q_options.keys()), index=3)
+cfg_design_q_mult = design_q_options[cfg_design_q_label]
+
+# UPDATED: Recalibrated Defaults per Claude's Math Review
+cfg_yield_west = st.sidebar.number_input("Base Yield West (<94°E)", value=0.060, format="%.3f")
+cfg_yield_east = st.sidebar.number_input("Base Yield East (≥94°E)", value=0.070, format="%.3f")
+cfg_efficiency = st.sidebar.slider("Combined Efficiency (η)", 0.70, 0.95, 0.88, 0.01)
+cfg_head_loss = st.sidebar.slider("Head Loss Factor (h_f)", 0.05, 0.25, 0.10, 0.01)
+cfg_terrain_mult = st.sidebar.slider("Penstock Terrain Multiplier", 1.10, 1.80, 1.45, 0.05)
+cfg_default_plf = st.sidebar.slider("Base PLF Default", 0.40, 0.80, 0.60, 0.05)
+
+st.sidebar.header("Commercial Parameters")
 cfg_min_mw = st.sidebar.number_input("Policy Target Minimum (MW)", value=5.0, step=0.5)
 cfg_max_mw = st.sidebar.number_input("Ideal Target Ceiling (MW)", value=12.0, step=0.5)
-cfg_efficiency = st.sidebar.slider("Combined Efficiency (η)", 0.70, 0.90, 0.85, 0.01)
-cfg_head_loss = st.sidebar.slider("Head Loss Factor (h_f)", 0.05, 0.25, 0.13, 0.01)
-cfg_terrain_mult = st.sidebar.slider("Penstock Terrain Multiplier", 1.10, 1.80, 1.45, 0.05)
-cfg_yield_west = st.sidebar.number_input("Specific Yield West (<94°E)", value=0.025, format="%.4f")
-cfg_yield_east = st.sidebar.number_input("Specific Yield East (≥94°E)", value=0.035, format="%.4f")
-cfg_default_plf = st.sidebar.slider("Base PLF Default", 0.40, 0.70, 0.60, 0.05)
 cfg_substation_limit = st.sidebar.number_input("Max Substation Distance Buffer (km)", value=20.0, step=5.0)
 cfg_is_apst = st.sidebar.checkbox("APST Local Partner Active", value=True)
 cfg_road_km = st.sidebar.number_input("Assumed Access Road Construction (km)", value=2.0, step=0.5)
@@ -163,7 +179,6 @@ def process_intake(click_lat, click_lng):
             max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
             if max_dict and max_dict.get('upa') and max_dict.get('upa') >= 10.0:
                 max_upa = max_dict.get('upa')
-                # FIX: Explicitly cast to integer to prevent reduceToVectors crash
                 max_pixel_img = ee.Image.constant(1).toInt().updateMask(clipped.eq(max_upa))
                 vectors = max_pixel_img.reduceToVectors(geometry=buffer, scale=90, geometryType='centroid')
                 snapped_coords = vectors.first().geometry().coordinates().getInfo()
@@ -184,25 +199,37 @@ def process_intake(click_lat, click_lng):
         st.error(f"GEE processing anomaly: {str(ex)}")
         return False
 
-def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng):
+# NEW: process_calculations now accepts manual_head
+def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng, manual_head=None):
     try:
-        dem = ee.Image('MERIT/DEM/v1_0_3').select('dem')
-        elev_in = dem.sample(ee.Geometry.Point([intake_lng, intake_lat]), scale=90).first().get('dem').getInfo()
-        elev_p = dem.sample(ee.Geometry.Point([ph_lng, ph_lat]), scale=90).first().get('dem').getInfo()
-        
-        gross_h = elev_in - elev_p
-        if gross_h <= 0:
-            return {"error": f"Hydraulic violation: Powerhouse elevation ({elev_p}m) equal to or higher than Intake ({elev_in}m)."}
+        if manual_head and manual_head > 0:
+            gross_h = manual_head
+            elev_in = "Manual Override"
+            elev_p = "Manual Override"
+        else:
+            dem = ee.Image('MERIT/DEM/v1_0_3').select('dem')
+            elev_in = dem.sample(ee.Geometry.Point([intake_lng, intake_lat]), scale=90).first().get('dem').getInfo()
+            elev_p = dem.sample(ee.Geometry.Point([ph_lng, ph_lat]), scale=90).first().get('dem').getInfo()
+            gross_h = elev_in - elev_p
+            
+            if gross_h <= 0:
+                return {"error": f"Hydraulic violation: Powerhouse elevation ({elev_p}m) equal to or higher than Intake ({elev_in}m)."}
         
         net_h = gross_h * (1.0 - cfg_head_loss)
-        specific_yield = cfg_yield_west if intake_lng < 94.0 else cfg_yield_east
+        
+        # UPDATED: Incorporating Base Yield + UI Multiplier
+        base_yield = cfg_yield_west if intake_lng < 94.0 else cfg_yield_east
+        specific_yield = base_yield * cfg_design_q_mult
+        
         q_design = catchment_km2 * specific_yield
         p_mw = q_design * net_h * 9.81 * cfg_efficiency / 1000.0
         
         chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY').filterDate('2000-01-01', '2024-12-31').filter(ee.Filter.calendarRange(1, 3, 'month'))
         mean_lean_daily = chirps.mean().reduceRegion(ee.Reducer.mean(), ee.Geometry.Point([intake_lng, intake_lat]).buffer(5000), 5500).get('precipitation').getInfo()
         
-        effective_plf = cfg_default_plf * 0.4 if (mean_lean_daily and (mean_lean_daily * 30.0) < 40.0) else cfg_default_plf
+        # UPDATED: Adjusted Lean Season Threshold & Penalty
+        mean_lean_monthly = (mean_lean_daily * 30.0) if mean_lean_daily else 0
+        effective_plf = cfg_default_plf * 0.75 if (0 < mean_lean_monthly < 25.0) else cfg_default_plf
         annual_mwh = p_mw * 8760.0 * effective_plf
         
         straight_line_km = haversine_km(intake_lat, intake_lng, ph_lat, ph_lng)
@@ -285,7 +312,6 @@ with col_map:
 
     folium.LayerControl(position="topright").add_to(m)
     
-    # We only request clicks from Streamlit-Folium to prevent bounce loops
     map_output = st_folium(m, width="100%", height=650, key="prospector_map", returned_objects=["last_clicked", "last_object_clicked"])
     
     if map_output:
@@ -313,7 +339,7 @@ with col_map:
                 push_state_to_history()
                 if process_intake(click_lat, click_lng):
                     if "ph_lat" in sd:
-                        res = process_calculations(st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"], st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"])
+                        res = process_calculations(st.session_state["site_data"]["intake_lat"], st.session_state["site_data"]["intake_lng"], st.session_state["site_data"]["catchment_km2"], sd["ph_lat"], sd["ph_lng"], manual_head=st.session_state.get("manual_head_val"))
                         if "error" not in res:
                             st.session_state["site_data"] = res
                             st.session_state["workflow_state"] = "COMPLETE"
@@ -321,7 +347,7 @@ with col_map:
                     
             elif st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "RELOCATE_POWERHOUSE"]:
                 push_state_to_history()
-                res = process_calculations(sd["intake_lat"], sd["intake_lng"], sd["catchment_km2"], click_lat, click_lng)
+                res = process_calculations(sd["intake_lat"], sd["intake_lng"], sd["catchment_km2"], click_lat, click_lng, manual_head=st.session_state.get("manual_head_val"))
                 if "error" in res: 
                     st.error(res["error"])
                 else:
@@ -353,14 +379,19 @@ with col_dash:
     elif st.session_state["workflow_state"] == "RELOCATE_POWERHOUSE":
         st.warning("📍 RELOCATION MODE: Click anywhere on the map to drop the POWERHOUSE pin.")
 
-    with st.expander("Manual Coordinate Overrides (DMS or Decimal)", expanded=(st.session_state["workflow_state"] in ["AWAITING_INTAKE", "AWAITING_POWERHOUSE"])):
+    with st.expander("⚙️ Manual Overrides (Coordinates & Topography)", expanded=(st.session_state["workflow_state"] in ["AWAITING_INTAKE", "AWAITING_POWERHOUSE"])):
         in_coord_val = st.text_input("Intake Coordinates", value=format_combined_dms(sd.get("intake_lat"), sd.get("intake_lng")), placeholder="27°54'16.27\"N 94°06'07.18\"E")
         
         ph_coord_val = ""
         if st.session_state["workflow_state"] in ["AWAITING_POWERHOUSE", "COMPLETE", "RELOCATE_POWERHOUSE", "RELOCATE_INTAKE"]:
             ph_coord_val = st.text_input("Powerhouse Coordinates", value=format_combined_dms(sd.get("ph_lat"), sd.get("ph_lng")), placeholder="27°50'12.00\"N 94°08'05.00\"E")
-        
-        if st.button("Apply Manual Coordinates Engine"):
+            
+        # NEW: Manual Gross Head Override
+        st.markdown("---")
+        manual_head_val = st.number_input("Bypass DEM: Surveyed Gross Head (m)", value=0.0, step=1.0, format="%.2f", help="Enter a value to override satellite topography (e.g., 88.95 from a DPR). Leave as 0.0 to use automatic DEM generation.")
+        st.session_state["manual_head_val"] = manual_head_val if manual_head_val > 0 else None
+
+        if st.button("Apply Manual Overrides"):
             push_state_to_history()
             p_in_lat, p_in_lng = parse_combined_coords(in_coord_val)
             p_ph_lat, p_ph_lng = parse_combined_coords(ph_coord_val) if ph_coord_val else (None, None)
@@ -370,7 +401,7 @@ with col_dash:
                     if process_intake(p_in_lat, p_in_lng): st.rerun()
                 else:
                     if "catchment_km2" not in sd: process_intake(p_in_lat, p_in_lng)
-                    res = process_calculations(p_in_lat, p_in_lng, st.session_state["site_data"].get("catchment_km2", 100), p_ph_lat, p_ph_lng)
+                    res = process_calculations(p_in_lat, p_in_lng, st.session_state["site_data"].get("catchment_km2", 100), p_ph_lat, p_ph_lng, manual_head=st.session_state.get("manual_head_val"))
                     if "error" in res: 
                         st.error(res["error"])
                     else:
