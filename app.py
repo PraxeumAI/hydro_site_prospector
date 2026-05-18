@@ -173,19 +173,29 @@ def process_intake(click_lat, click_lng):
     merit_hydro = ee.Image('MERIT/Hydro/v1_0_1')
     try:
         upa_val = merit_hydro.select('upa').sample(pt, scale=90).first().get('upa').getInfo()
+        
+        # If the direct click is too low, try to snap it within 250m
         if upa_val is None or upa_val < 10.0:
             buffer = pt.buffer(250)
             clipped = merit_hydro.select('upa').clip(buffer)
             max_dict = clipped.reduceRegion(ee.Reducer.max(), buffer, 90).getInfo()
+            
             if max_dict and max_dict.get('upa') and max_dict.get('upa') >= 10.0:
                 max_upa = max_dict.get('upa')
                 max_pixel_img = ee.Image.constant(1).toInt().updateMask(clipped.eq(max_upa))
                 vectors = max_pixel_img.reduceToVectors(geometry=buffer, scale=90, geometryType='centroid')
-                snapped_coords = vectors.first().geometry().coordinates().getInfo()
-                click_lng, click_lat = snapped_coords[0], snapped_coords[1]
-                upa_val = max_upa
-                st.toast("Pin snapped to nearest high-flow channel.")
+                
+                # FIX: Check if the vector list is actually populated before pulling coordinates
+                if vectors.size().getInfo() > 0:
+                    snapped_coords = vectors.first().geometry().coordinates().getInfo()
+                    click_lng, click_lat = snapped_coords[0], snapped_coords[1]
+                    upa_val = max_upa
+                    st.toast("Pin snapped to nearest high-flow channel.", icon="💧")
+                else:
+                    st.error("Edge-case geometry glitch: Please click slightly closer to the visible stream.")
+                    return False
         
+        # Final validation
         if upa_val and upa_val >= 10.0:
             st.session_state["site_data"]["intake_lat"] = click_lat
             st.session_state["site_data"]["intake_lng"] = click_lng
@@ -195,10 +205,10 @@ def process_intake(click_lat, click_lng):
         else:
             st.error("Catchment area falls below 10 sq km baseline. Re-click nearer a verified stream reach.")
             return False
+            
     except Exception as ex:
         st.error(f"GEE processing anomaly: {str(ex)}")
         return False
-
 # NEW: process_calculations now accepts manual_head
 def process_calculations(intake_lat, intake_lng, catchment_km2, ph_lat, ph_lng, manual_head=None):
     try:
